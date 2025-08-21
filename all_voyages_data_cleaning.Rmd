@@ -1,0 +1,85 @@
+---
+title: "All_voyages data clean"
+output: html_document
+date: "2025-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+file_path <- "all_voyages.csv"                
+df <- read.csv(file_path, stringsAsFactors = FALSE)
+```
+
+```{r}
+head(df)
+```
+
+```{r}
+str(df)
+```
+```{r}
+summary(df)    # stats of the data
+```
+
+```{r}
+colSums(is.na(df))   # missing per column
+```
+```{r}
+sapply(df, function(x) length(unique(x)))   # unique values per column
+```
+```{r}
+names(df) <- tolower(gsub("\\s+", "_", names(df)))
+
+```
+
+
+```{r}
+names(df)
+```
+```{r}
+# Trimming whitespace on character columns
+for (nm in names(df)) {
+  if (is.character(df[[nm]])) df[[nm]] <- trimws(df[[nm]])
+}
+```
+
+```{r}
+df[] <- lapply(df, function(x) {
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x == ""] <- NA
+  }
+  x
+})
+
+# Drop columns that are all NA
+df <- df[, sapply(df, function(x) !all(is.na(x))), drop = FALSE]
+```
+
+```{r}
+head(df)
+```
+
+```{r}
+colSums(is.na(df))
+```
+```{r}
+na_report <- data.frame(
+  column       = names(df),
+  n_missing    = colSums(is.na(df)),
+  pct_missing  = round(100 * colMeans(is.na(df)), 1)
+)
+na_report <- na_report[order(-na_report$n_missing), ]
+print(na_report, row.names = FALSE)
+
+
+```
+
+```{r}
+write.csv(df, "cleaned_data.csv", row.names = FALSE)
+```
+
