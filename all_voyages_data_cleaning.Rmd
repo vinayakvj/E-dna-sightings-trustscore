@@ -26,29 +26,74 @@ summary(df)    # stats of the data
 ```
 
 ```{r}
-colSums(is.na(df))   # missing per column
-```
-```{r}
-sapply(df, function(x) length(unique(x)))   # unique values per column
-```
-```{r}
-names(df) <- tolower(gsub("\\s+", "_", names(df)))
-
-```
-
-
-```{r}
 names(df)
+```
+
+
+```{r}
+colSums(df)   # missing per column
+```
+
+```{r}
+# keep just the variables we care about and harmonise a few names
+library(dplyr)
+
+# replace `main_tbl` with your data frame name
+result_tbl <- df %>%
+  # select only the relevant columns (any_of() won't error if some are missing)
+  select(any_of(c(
+    # core evidence
+    "ASV_sequence", "X.ID", "count",
+    # taxonomy
+    "order", "family", "genus", "species", "LCA",
+    # geography
+    "decimalLatitude", "decimalLongitude",
+    # assay variants (we'll coalesce these below)
+    "assay_name", "Assay", "Gene",
+    # optional identifiers that are often handy
+    "ASV", "sample"
+  ))) %>%
+  # create harmonised columns (percent_id, assay) without losing originals
+  mutate(
+    percent_id = if ("X.ID" %in% names(.)) X.ID else NA_real_,
+    assay      = dplyr::coalesce(!!!rlang::syms(intersect(c("assay_name","Assay","Gene"), names(.))))
+  ) %>%
+  # final column order (adjust if you want)
+  select(
+    any_of(c("ASV","sample")),
+    ASV_sequence, count, percent_id,
+    order, family, genus, species, LCA,
+    decimalLatitude, decimalLongitude,
+    assay
+  )
+
+# peek
+dplyr::glimpse(result_tbl)
+
+```
+
+
+```{r}
+sapply(result_tbl, function(x) length(unique(x)))   # unique values per column
+```
+```{r}
+names(result_tbl) <- tolower(gsub("\\s+", "_", names(result_tbl)))
+
+```
+
+
+```{r}
+names(result_tbl)
 ```
 ```{r}
 # Trimming whitespace on character columns
-for (nm in names(df)) {
-  if (is.character(df[[nm]])) df[[nm]] <- trimws(df[[nm]])
+for (nm in names(result_tbl)) {
+  if (is.character(result_tbl[[nm]])) result_tbl[[nm]] <- trimws(result_tbl[[nm]])
 }
 ```
 
 ```{r}
-df[] <- lapply(df, function(x) {
+result_tbl[] <- lapply(result_tbl, function(x) {
   if (is.character(x)) {
     x <- trimws(x)
     x[x == ""] <- NA
@@ -57,7 +102,7 @@ df[] <- lapply(df, function(x) {
 })
 
 # Drop columns that are all NA
-df <- df[, sapply(df, function(x) !all(is.na(x))), drop = FALSE]
+result_tbl <- result_tbl[, sapply(result_tbl, function(x) !all(is.na(x))), drop = FALSE]
 ```
 
 ```{r}
