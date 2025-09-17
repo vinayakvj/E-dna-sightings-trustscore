@@ -15,6 +15,9 @@ The problems in the data import all relate to column 22 ("neg_cont_type") which 
 
 ```{r}
 library(tidyverse)
+library(httr)
+library(jsonlite)
+library(purrr)
 
 # Load in the full dataset
 data <- read_csv("../Data/all_voyages.csv")
@@ -44,7 +47,7 @@ table(data$assay_name, useNA="always")
 # Drop "assay_name" from the data
 data <- select(data, -assay_name)
 
-# Create a new variable this the string length of the ASV sequence
+# Create a new variable which is the string length of the ASV sequence
 data$Assay_Length <- nchar(data$ASV_sequence)
 
 # Re-order columns so related data is next to each other
@@ -63,11 +66,16 @@ str(data)
 NW_12S <- read_csv("../Data/Marine fish_Miya_12S_Northwest Australian Shelf.csv")
 SW_12S <- read_csv("../Data/Marine fish_Miya_12S_Southwest Australian Shelf.csv")
 WC_12S <- read_csv("../Data/Marine fish_Miya_12S_West Central Australian Shelf.csv")
+
+NW_16S <- read_csv("../Data/Marine fish_DiBattista_16S_Northwest Australian Shelf.csv")
+SW_16S <- read_csv("../Data/Marine fish_DiBattista_16S_Southwest Australian Shelf.csv")
+WC_16S <- read_csv("../Data/Marine fish_DiBattista_16S_West Central Australian Shelf.csv")
 ```
 
+### Merge 12S
 
 ```{r}
-# Merge the datafiles and then check to see if the sequenced value is consistent across regions
+# Merge the 12S datafiles and then check to see if the sequenced value is consistent across regions
 
 # Select only the species and Sequenced columns, renaming Sequenced to match region
 NW_12S <- NW_12S %>% select(Species, Sequenced) %>% rename(Northwest = Sequenced)
@@ -75,12 +83,12 @@ SW_12S <- SW_12S %>% select(Species, Sequenced) %>% rename(Southwest = Sequenced
 WC_12S <- WC_12S %>% select(Species, Sequenced) %>% rename(WestCentral = Sequenced)
 
 # Join all three data frames by Species
-merged_data <- NW_12S %>%
+merged_data_12S <- NW_12S %>%
   full_join(SW_12S, by = "Species") %>%
   full_join(WC_12S, by = "Species")
 
 # Reorder so Species is the first column
-merged_12S_coverage <- merged_data %>% relocate(Species, .before = 1)
+merged_12S_coverage <- merged_data_12S %>% relocate(Species, .before = 1)
 
 head(merged_12S_coverage)
 ```
@@ -107,7 +115,8 @@ merged_12S_coverage <- merged_12S_coverage %>%
   rename(genus_species = Species) %>%
   separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
 ```
-Checking the warning rows to see what's happened. Looks like the species name is duplicated in most cases and in a small number of others it's a subspecies. Searching for these sub species on Obis.org they're not classes as valid (i.e. https://obis.org/taxon/236453) so the parent species should be sufficient for our needs.
+
+Checking the warning rows to see what's happened. Looks like the species name is duplicated in most cases and in a small number of others it's a subspecies. Searching for these sub species on Obis.org they're not classed as valid (i.e. https://obis.org/taxon/236453) so the parent species should be sufficient for our needs.
 
 ```{r}
 problem_rows <- merged_12S_coverage %>%
@@ -116,7 +125,56 @@ problem_rows <- merged_12S_coverage %>%
 # Inspect them
 print(problem_rows)
 ```
+
+### Merge 16S
+
+```{r}
+# Merge the 16S datafiles and then check to see if the sequenced value is consistent across regions
+
+# Select only the species and Sequenced columns, renaming Sequenced to match region
+NW_16S <- NW_16S %>% select(Species, Sequenced) %>% rename(Northwest = Sequenced)
+SW_16S <- SW_16S %>% select(Species, Sequenced) %>% rename(Southwest = Sequenced)
+WC_16S <- WC_16S %>% select(Species, Sequenced) %>% rename(WestCentral = Sequenced)
+
+# Join all three data frames by Species
+merged_data_16S <- NW_16S %>%
+  full_join(SW_16S, by = "Species") %>%
+  full_join(WC_16S, by = "Species")
+
+# Reorder so Species is the first column
+merged_16S_coverage <- merged_data_16S %>% relocate(Species, .before = 1)
+
+head(merged_16S_coverage)
+
+# Check to see whether there are any conflicts i.e. rows with both yes and no
+conflicts <- merged_12S_coverage %>%
+  rowwise() %>%
+  filter(any(c_across(-Species) == "Yes", na.rm = TRUE) &
+         any(c_across(-Species) == "No",  na.rm = TRUE)) %>%
+  ungroup()
+
+if (nrow(conflicts) == 0) {
+  message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
+} else {
+  message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
+  print(conflicts)
+}
+
+# Split the "Species" column as it actually contains Genus and Species together
+merged_16S_coverage <- merged_16S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+
+problem_rows <- merged_16S_coverage %>%
+  filter(grepl("_.*_", genus_species))
+
+# Inspect them
+print(problem_rows)
+```
+
 ## Calculate species DNA coverage across all 3 regions
+
+### 12S
 
 ```{r}
 # Create a yes/no record across all 3 regions
@@ -132,7 +190,7 @@ merged_12S_coverage <- merged_12S_coverage %>%
   ungroup()
 
 # Calculate DNA coverage per species
-genus_summary <- merged_12S_coverage %>%
+genus_summary_12S <- merged_12S_coverage %>%
   group_by(Genus) %>%
   summarise(
     TotalSpecies = n(),
@@ -142,8 +200,94 @@ genus_summary <- merged_12S_coverage %>%
   arrange(Genus)
 
 # View results
-print(genus_summary)
+print(genus_summary_12S)
 ```
+
+### 16S
+
+```{r}
+# Create a yes/no record across all 3 regions
+merged_16S_coverage <- merged_16S_coverage %>%
+  rowwise() %>%
+  mutate(
+    AllRegions = if_else(
+      any(c_across(c(Northwest, WestCentral, Southwest)) == "Yes", na.rm = TRUE),
+      "Yes",
+      "No"
+    )
+  ) %>%
+  ungroup()
+
+# Calculate DNA coverage per species
+genus_summary_16S <- merged_16S_coverage %>%
+  group_by(Genus) %>%
+  summarise(
+    TotalSpecies = n(),
+    YesCount = sum(AllRegions == "Yes"),
+    ProportionYes = YesCount / TotalSpecies
+  ) %>%
+  arrange(Genus)
+
+# View results
+print(genus_summary_16S)
+```
+## Merge the 16S and 12S dataframes to compare
+
+```{r}
+# Rename columns to avoid problems when merging
+genus_summary_12S <- genus_summary_12S %>%
+  rename(
+    TotalSpecies_12S   = TotalSpecies,
+    YesCount_12S       = YesCount,
+    ProportionYes_12S  = ProportionYes
+  )
+
+genus_summary_16S <- genus_summary_16S %>%
+  rename(
+    TotalSpecies_16S   = TotalSpecies,
+    YesCount_16S       = YesCount,
+    ProportionYes_16S  = ProportionYes
+  )
+
+# Full join them by Genus so you get both sets of columns
+genus_summary_combined <- full_join(
+  genus_summary_12S,
+  genus_summary_16S,
+  by = "Genus"
+)
+
+# Reorder for readability
+genus_summary_combined <- genus_summary_combined %>%
+  select(
+    Genus,
+    TotalSpecies_12S, TotalSpecies_16S,
+    YesCount_12S, YesCount_16S, 
+    ProportionYes_12S, ProportionYes_16S
+  )
+
+genus_summary_combined
+```
+
+```{r}
+# Check to see if the TotalSpecies value is consistent
+genus_summary_combined %>% filter(TotalSpecies_12S != TotalSpecies_16S)
+```
+
+
+```{r}
+# There's no mismatches so we can drop one of the columns and rename
+genus_summary_combined <- genus_summary_combined %>% select(-TotalSpecies_16S) %>% rename(TotalSpecies = TotalSpecies_12S)
+genus_summary_combined
+```
+```{r}
+# See which species have the same vs. different data for 12S vs. 16S
+(diff_counts <- count(genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)))
+(same_counts <- count(genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)))
+genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)
+genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)
+```
+
+
 ## Apply species DNA coverage value back to the original dataframe
 
 ```{r}
@@ -172,27 +316,41 @@ data %>% count(Assay)
 ```
 
 ```{r}
-### Update the dataframe with the genus DNA coverage for rows where a 12S DNA match was used
-
-# Join genus_summary to main data on Genus
+# Update the dataframe with the genus DNA coverage based on whether a 12S or 16S match was used
 data <- data %>%
   left_join(
-    genus_summary %>% select(Genus,ProportionYes),
+    genus_summary_combined,
     by = c("genus" = "Genus")
-  )
-
-# Rename and relocate ProportionYes column
-data <- data %>% rename(Pct_GenusDNA_inDB = ProportionYes)
-data <- data %>% relocate(Pct_GenusDNA_inDB, .after = 9)
+  ) %>%
+  mutate(
+    Pct_GenusDNA_inDB = case_when(
+      Assay_Type == "12S" ~ ProportionYes_12S,
+      Assay_Type == "16S" ~ ProportionYes_16S,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  relocate(Pct_GenusDNA_inDB, .after = 9)
 ```
 
 ```{r}
 str(data)
 ```
 
-# Export data back out to CSV for others to use
+## Export data back out to CSV for others to use
 
 ```{r}
 write_csv(data, "../Data/data_with_genus_dna_pct.csv")
 ```
 
+## Build a list of unique Genus / Species pairs in the datafile
+
+```{r}
+genus_species <- data[,"species"]
+genus_species <- unique(genus_species)
+genus_species$genus_species <- genus_species$species
+genus_species <- genus_species %>% separate(genus_species, into = c("Genus", "Species"), sep = " ", remove=FALSE)
+genus_species <- genus_species %>% filter(!is.na(Genus))
+genus_species <- genus_species %>% filter(Genus != "dropped")
+genus_species <- genus_species[,c("Genus","Species","genus_species")]
+genus_species
+```
