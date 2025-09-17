@@ -1,0 +1,224 @@
+---
+title: "R reading NCBI"
+author: "Ray Stokes"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Reading in Files from NCBI
+
+
+First load a library so we can use the GET command to retrieve information from websites:
+
+```{r}
+library(httr)
+```
+
+
+Fetch the zip file from the NCBI website, where all the 'dumped' files are, which contain information that may be useful
+
+```{r}
+fetched_file = GET("https://ftp.ncbi.nih.gov/pub/taxonomy/taxdmp.zip")
+```
+
+Now we need to save this to an actual file that can be used, using the *writeBin* function
+```{r}
+file_path <- "taxdmp.zip"
+writeBin(content(fetched_file, "raw"), file_path)
+```
+
+We can use a linux command inside R using the "system" function to see the new zip file that was created:
+
+```{r}
+system("ls")
+```
+
+Now that we have the taxdmp.zip file, we can extract its contents from R:
+
+```{r}
+# Lets extract the contents of the file into a folder called "DataFolder"
+folder_name = 'DataFolder'
+command = paste("unzip",file_path,'-d',folder_name)
+paste("Executing linux command:",command)
+system(command)
+```
+
+
+Now check what is in the data folder (and how big the files are):
+
+```{r}
+command = paste("ls -s",folder_name)
+paste("Executing linux command:",command)
+system(command)
+```
+
+This database is tricky to process. We can view the contents of the readme file to see if that will help:
+```{r}
+command = paste("cat ",folder_name,"/readme.txt",sep="")
+paste("Executing linux command:",command)
+system(command)
+```
+
+Read the nodes from the data frame. Note, we cannot simply use read.csv or similar to remove field terminators "\t|\t", since they only accept one character. Hence, we need to remove the tabs "\t" first
+```{r}
+ncbi_nodes_df_read <- read.delim("DataFolder/nodes.dmp",sep="\t")
+head(ncbi_nodes_df_read)
+```
+
+Now we can remove the "|" vertical line separators, which occur every second column
+
+```{r}
+columns_to_keep = seq(1,25,2)
+ncbi_nodes_df <- ncbi_nodes_df_read[,columns_to_keep]
+names(ncbi_nodes_df) <- c("tax_id","parent tax_id","rank","embl code","division id",
+                          "inherited div flag  (1 or 0)","genetic code id","inherited GC  flag  (1 or 0)",
+                          "mitochondrial genetic code id","inherited MGC flag  (1 or 0)","GenBank hidden flag (1 or 0)",
+                           "hidden subtree root flag (1 or 0)","comments")
+head(ncbi_nodes_df)
+```
+
+
+The other large file is the "names" folder
+
+```{r}
+ncbi_names_df_read <- read.delim("DataFolder/names.dmp",sep="\t")
+head(ncbi_names_df_read)
+```
+
+Once again, remove columns with "|" and rename remaining columns:
+
+```{r}
+columns_to_keep = seq(1,7,2)
+ncbi_names_df <- ncbi_names_df_read[,columns_to_keep]
+names(ncbi_names_df) <- c("tax_id","name_txt","unique name","name class")
+head(ncbi_names_df)
+```
+
+
+	tax_id					-- the id of node associated with this name
+	name_txt				-- name itself
+	unique name				-- the unique variant of this name if name not unique
+	name class				-- (synonym, common name, ...)
+
+
+
+
+
+There was also this in the website:
+"Disclaimer: The NCBI taxonomy database is not an authoritative source for nomenclature or classification - please consult the relevant scientific literature for the most reliable information."
+
+
+
+
+# Using BLAST from NCBI
+
+The ASV sequence is in the first row of our dataset is:
+```{r}
+first_asv = "CGGTCCGTTGATCGGCATTGCCGGATCTTATTGGTCAGAAATTCTGTTCATTAGAGCTGCAGCTCTTGGTTGTAGGAGGTAGTACTCCCATTCCACGTGGGGGTTTTTTATTTCCCCGCGGTCGCCCCAACCAAAGACATGGGGGCATGATTCATTTGGTTTAGCCCTTTGTTTAGGGGTGTTTAACATGATATGCCTTGGT"
+```
+
+
+If we type the sequence into this webpage:
+
+
+https://blast.ncbi.nlm.nih.gov/Blast.cgi?PROGRAM=blastn&PAGE_TYPE=BlastSearch&LINK_LOC=blasthome
+
+and click "BLAST" at the bottom, we get a range of hits:
+
+```{r}
+top_few_hits <-"Select seq LC636719.1	Auxis thazard SNFR 15926 mitochondrial gene for 16S rRNA, partial sequence	Auxis thazard	374	374	100%	4e-99	100.00%	575	LC636719.1
+Select seq MW232421.1	Auxis rochei voucher USNM 403146 mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16505	MW232421.1
+Select seq PX070027.1	Auxis rochei voucher USNM:FISH:424772 mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16505	PX070027.1
+Select seq KM055378.1	Auxis thazard isolate CD-zj-bdj 16S ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	573	KM055378.1
+Select seq AB105165.1	Auxis rochei mitochondrial DNA, complete genome, haplotype:II Ecuadorian	Auxis rochei	374	374	100%	4e-99	100.00%	16503	AB105165.1
+Select seq OM980756.1	Auxis thazard isolate 12392 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	523	OM980756.1
+Select seq MK548578.1	Auxis rochei mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16505	MK548578.1
+Select seq KP259548.1	Auxis rochei voucher ECSFRI-YDJ01 mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16505	KP259548.1
+Select seq OP057064.2	Auxis thazard voucher SIO:15cb0e59-8d53-44e1-82c7-643efc15c7f2 mitochondrion, complete genome	Auxis thazard	374	374	100%	4e-99	100.00%	16509	OP057064.2
+Select seq OM980752.1	Auxis thazard isolate 12388 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	476	OM980752.1
+Select seq KM651784.1	Auxis rochei mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16505	KM651784.1
+Select seq KP259551.1	Auxis thazard voucher ECSFRI-BDJ01 mitochondrion, complete genome	Auxis thazard	374	374	100%	4e-99	100.00%	16509	KP259551.1
+Select seq NC_005313.1	Auxis rochei mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16501	NC_005313.1
+Select seq MK801690.1	Auxis thazard mitochondrion, complete genome	Auxis thazard	374	374	100%	4e-99	100.00%	16506	MK801690.1
+Select seq LC636718.1	Auxis thazard SNFR 15925 mitochondrial gene for 16S rRNA, partial sequence	Auxis thazard	374	374	100%	4e-99	100.00%	575	LC636718.1
+Select seq OM980751.1	Auxis thazard isolate 12387 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	497	OM980751.1
+Select seq OM980755.1	Auxis thazard isolate 12391 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	471	OM980755.1
+Select seq KM055379.1	Auxis rochei isolate CD-zj-ydj 16S ribosomal RNA gene, partial sequence; mitochondrial	Auxis rochei	374	374	100%	4e-99	100.00%	571	KM055379.1
+Select seq MW595821.1	Auxis rochei isolate AR 16s IFPGS large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis rochei	374	374	100%	4e-99	100.00%	594	MW595821.1
+Select seq MW232425.1	Auxis rochei voucher USNM 424772 mitochondrion, complete genome	Auxis rochei	374	374	100%	4e-99	100.00%	16509	MW232425.1
+Select seq PX070028.1	Auxis thazard voucher USNM:FISH:413358 mitochondrion, complete genome	Auxis thazard	374	374	100%	4e-99	100.00%	16509	PX070028.1
+Select seq PV653005.1	Auxis thazard voucher 16srRNA_F/R_AUTH11/FT11 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	374	374	100%	4e-99	100.00%	592	PV653005.1
+Select seq AB103468.1	Auxis rochei mitochondrial DNA, complete genome, haplotype:II Mediterranean	Auxis rochei	374	374	100%	4e-99	100.00%	16503	AB103468.1
+Select seq LN558762.1	Auxis thazard mitochondrial partial 16S rRNA gene, specimen voucher A.t1	Auxis thazard	368	368	100%	2e-97	99.50%	569	LN558762.1
+Select seq OM980758.1	Auxis rochei isolate 12394 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis rochei	368	368	100%	2e-97	99.50%	528	OM980758.1
+Select seq OM980754.1	Auxis thazard isolate 12390 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	368	368	100%	2e-97	99.50%	524	OM980754.1
+Select seq NC_005318.1	Auxis thazard mitochondrion, complete genome	Auxis thazard	368	368	100%	2e-97	99.50%	16506	NC_005318.1
+Select seq OM980750.1	Auxis thazard isolate 12386 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Auxis thazard	368	368	100%	2e-97	99.50%	529	OM980750.1
+Select seq KM198903.1	Euthynnus affinis 16S ribosomal RNA gene, partial sequence; mitochondrial	Euthynnus affinis	364	364	98%	2e-96	100.00%	394	KM198903.1
+Select seq PV069720.1	Thunnus orientalis isolate LGM084 mitochondrion, complete genome	Thunnus orientalis	346	346	100%	8e-91	97.52%	16550	PV069720.1
+Select seq KM055373.1	Thunnus maccoyii isolate CD-zj-lq 16S ribosomal RNA gene, partial sequence; mitochondrial	Thunnus maccoyii	346	346	100%	8e-91	97.52%	573	KM055373.1
+Select seq NC_005316.1	Katsuwonus pelamis mitochondrion, complete genome	Katsuwonus pelamis	346	346	100%	8e-91	97.52%	16515	NC_005316.1
+Select seq NC_008455.1	Thunnus orientalis mitochondrion, complete genome	Thunnus orientalis	346	346	100%	8e-91	97.52%	16527	NC_008455.1
+Select seq MW960054.1	Thunnus sp. abtuna1 large subunit ribosomal RNA gene, partial sequence; mitochondrial	Thunnus sp. abtuna1	346	346	100%	8e-91	97.52%	561	MW960054.1
+Select seq LC377898.1	Thunnus orientalis mitochondrial DNA, complete genome	Thunnus orientalis	346	346	100%	8e-91	97.52%	16527	LC377898.1
+Select seq HM071030.1	Thunnus obesus 16S ribosomal RNA gene, partial sequence; mitochondrial	Thunnus obesus	346	346	100%	8e-91	97.52%	514	HM071030.1"
+```
+
+
+
+
+
+
+### The Microsoft Copilot AI claims that this will work using R:
+
+```{r}
+library(rentrez)
+```
+
+Where you can use: install.packages("rentrez") to get the package if it is needed
+Looks like it is still in a html format. 
+
+
+```{r}
+result <- entrez_search(db = "nucleotide", term = first_asv)
+result
+```
+But, there are zero hits.
+
+Using a simpler DNA sequence does give a result
+
+```{r}
+entrez_search(db = "nucleotide", term = "AGTTAAA") #random sequence
+```
+
+
+So not sure what is being done wrong. 
+
+
+
+
+
+Also, Blast has some user guidelines for API
+
+**Usage Guidelines**
+*The NCBI BLAST servers are a shared resource. We give priority to interactive users. In order to ensure availability of the service to the entire community, we may limit searches for some high volume users. Interactive users of the NCBI webpages through a web browser should not encounter problems. We will move searches of users who submit more than 100 searches in a 24 hour period to a slower queue, or, in extreme cases, will block the requests. To avoid problems, API users should comply with the following guidelines:*
+
+*Do not contact the server more often than once every 10 seconds.*
+
+*Do not poll for any single RID more often than once a minute.*
+
+*Use the URL parameter email and tool, so that the NCBI can contact you if there is a problem.*
+
+*Run scripts weekends or between 9 pm and 5 am Eastern time on weekdays if more than 50 searches will be submitted.*
+
+
+I think it suggests downloading databases locally for extensive use. 
+
+
+
