@@ -340,6 +340,8 @@ str(data)
 
 ```{r}
 write_csv(data, "../Data/data_with_genus_dna_pct.csv")
+data2000 <- data[1:2000,]
+write_csv(data2000, "../Data/data_with_genus_dna_pct_n2000.csv")
 ```
 
 ## Build a list of unique Genus / Species pairs in the datafile
