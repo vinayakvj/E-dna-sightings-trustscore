@@ -1,0 +1,314 @@
+---
+title: "eDNA GBIF Location Verifyer"
+author: "Nathan Reed (24110024)"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## INTRO
+
+In this markdown we're trying to ascertain whether an eDNA sample is accurate based on previous confirmed human observation of fish species.
+
+Requirements: "GBIF_Taxonomy.csv" exists in "../Data/" for all species in the datafile being processed below 
+If that file does not exist please run gbif_backbone_resolver.Rmd first to generate a list of species and their associated taxonKeys for the GBIF database / API
+
+**Libraries:**
+
+Note that on my system (Ubuntu 24.04 LTS) I needed to install:
+
+* libudunits2 (sudo apt install libudunits2-dev) before I could install the SF library from Cran
+* GDAL, GEOS, PROJ, netcdf, sqlite3 and tbb before I could install the RSpatial library from CRAN (sudo apt-get install libgdal-dev gdal-bin libgeos-dev libproj-dev libtbb-dev libnetcdf-dev)
+
+
+## Import and merge data
+
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(readr)
+library(rgbif)
+library(geosphere)
+library(progress)
+library(sf)
+library(ggplot2)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(lwgeom)
+
+# Work from a copy of "data" from  Species_DNA_Completeness.Rmd
+data_gbif <- data
+
+# Load the GBIF Taxonomy data
+tax_ref <- read_csv("../Data/GBIF_Taxonomy.csv", show_col_types = FALSE) %>%
+  distinct(species_input, .keep_all = TRUE)   # guard against accidental dupes
+
+# Join data$species to tax_ref$species_input
+data_gbif_enriched <- data_gbif %>%
+  left_join(
+    tax_ref %>% select(species_input, taxonKey, matchType),
+    by = c("species" = "species_input")
+  )
+
+# QA summaries for data matching
+unmatched <- data_gbif_enriched %>% filter(is.na(taxonKey))
+fuzzy     <- data_gbif_enriched %>% filter(!is.na(taxonKey), matchType != "EXACT")
+
+cat("Total rows: ", nrow(data_gbif_enriched), "\n")
+cat("Rows with a taxonKey: ", nrow(data_gbif_enriched) - nrow(unmatched), "\n")
+cat("Rows without a taxonKey: ", nrow(unmatched), "\n")
+cat("Rows with non-EXACT matches: ", nrow(fuzzy), "\n")
+
+write_csv(data_gbif_enriched, "../Data/data_with_genus_dna_pct_and_taxonKey.csv")
+```
+
+## Map the area of interest (AOI) for all our species
+
+Note that this requires a download through a validated account. Code is currently running using the following information:
+
+* Username: nathrek
+* Email: inbox@nathrek.co
+* Password: 8@B9&M6@B9o*!@6b
+
+```{r}
+Sys.setenv(GBIF_USER="nathrek", GBIF_PWD="8@B9&M6@B9o*!@6b", GBIF_EMAIL="inbox@nathrek.co")
+```
+
+Polling the GBIF API for location based observations by species row by row quickly hits the API rate limit.
+Instead we create a bounding box for all the locations in the datafile and then bulk download the GBIF data for species observations within that bounding box.
+
+```{r}
+# Keep only rows with coordinates and a taxonKey
+work <- data_gbif_enriched %>%
+  filter(!is.na(taxonKey), !is.na(decimalLatitude), !is.na(decimalLongitude))
+
+# Extract the list of taxonKeys from which to download location information
+taxa <- work$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 25
+pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+aoi_wkt   <- st_as_text(aoi_wgs84)  # small WKT polygon covering all sites+buffer
+
+```
+
+### Visualise the Area of Interest
+
+Visualising all the sampling points makes it obvious that we have an outlier / data error with one of the samples. We should remove this so that we have a more coherent area of interest.
+
+```{r}
+# Load basemap of Australia
+aus <- rnaturalearth::ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+### Remove invalid lat/lon
+
+```{r}
+# Compute centroid of all sampling points (ignoring NA)
+lat_mean <- mean(data_gbif_enriched$decimalLatitude, na.rm = TRUE)
+lon_mean <- mean(data_gbif_enriched$decimalLongitude, na.rm = TRUE)
+
+# Approximate great-circle distance from centroid (km)
+library(geosphere)
+data_with_dist <- data_gbif_enriched %>%
+  mutate(
+    distance_from_center_km = distHaversine(
+      cbind(decimalLongitude, decimalLatitude),
+      c(lon_mean, lat_mean)
+    ) / 1000
+  ) %>%
+  arrange(desc(distance_from_center_km))
+
+# Show the top 10 farthest points
+data_with_dist %>% select(species, decimalLatitude, decimalLongitude, distance_from_center_km) %>% head(10)
+
+```
+
+The erroneous location has Lat/Lon in the middle of the Pacific Ocean, but the field "geo_loc_name" is Indian Ocean: Diamantina. A lat/lon of -32.1088, 110.266 would put these samples in the correct location. To discuss with Philipp is whether we skip these rows or change the Lat/Lon to what we think is correct. For now I'm going to drop them from our analysis.
+
+```{r}
+hist(data$decimalLongitude)
+
+# Filter rows where longitude > 200
+suss_longitudes <- data %>% filter(decimalLongitude > 200)
+print(suss_longitudes)
+
+# Filter the original dataset to understand more about these locations
+data_lon200 <- read_csv("../Data/all_voyages.csv")
+data_lon200 <- data_lon200 %>% filter(decimalLongitude > 200)
+write_csv(data_lon200, "../Data/all_voyages_lon200.csv")
+```
+### Refit our AOI with rows containing invalid location data removed
+
+```{r}
+# Keep only rows with coordinates and a taxonKey
+work <- work %>% filter(decimalLongitude < 180)
+
+# Extract the list of taxonKeys from which to download location information
+taxa <- work$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 50
+pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+
+# Validate geometry as GBIF requires counter clockwise polygons
+aoi_wgs84 <- st_make_valid(aoi_wgs84)
+
+signed_area <- suppressWarnings(as.numeric(st_area(aoi_wgs84)))
+if (any(signed_area < 0)) {
+  message("AOI polygon is clockwise — reversing orientation to CCW.")
+  aoi_wgs84 <- st_reverse(aoi_wgs84)
+}
+
+aoi_wgs84 <- st_zm(aoi_wgs84)
+
+# If the polygon isn't working use a simple bounding box
+if (!st_is_valid(aoi_wgs84)) {
+  message("AOI polygon still invalid after reversing — using bounding box instead.")
+  bb <- st_bbox(aoi_wgs84)
+  aoi_wkt <- sprintf(
+    "POLYGON((%f %f,%f %f,%f %f,%f %f,%f %f))",
+    bb$xmin, bb$ymin,
+    bb$xmax, bb$ymin,
+    bb$xmax, bb$ymax,
+    bb$xmin, bb$ymax,
+    bb$xmin, bb$ymin
+  )
+} else {
+  aoi_wkt <- st_as_text(aoi_wgs84)
+}
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+## Download the data for all species in the AOI
+
+```{r}
+# GBIF download queries have a length limit (~12k chars), so we batch the taxonKeys.
+batch_size <- 200
+
+# Correct predicate builder: key, value (no "equals" literal),
+# and return a list of predicate objects.
+make_predicates <- function(keys, wkt) {
+  list(
+    pred("country", "AU"),
+    pred("hasCoordinate", TRUE),
+    pred_within(wkt),
+    pred_in("taxonKey", as.character(keys))
+    # Optional date filters:
+    # pred_gte("year", "2010"),
+    # pred_lte("year", "2025")
+  )
+}
+
+taxa_batches <- split(taxa, ceiling(seq_along(taxa) / batch_size))
+
+# Submit all batches & wait for completion
+dl_keys <- purrr::map(taxa_batches, function(keys) {
+  preds <- make_predicates(keys, aoi_wkt)
+
+  # occ_download() takes predicates as separate args; use do.call()
+  req <- do.call(occ_download, c(preds, list(format = "SIMPLE_CSV")))
+
+  # Wait until the download job finishes (SUCCEEDED/FAILED)
+  occ_download_wait(req)
+  req
+})
+
+# Retrieve & import all downloaded occurrences
+dl_dfs <- purrr::map(dl_keys, ~{
+  zip_path <- occ_download_get(.x)          # download zip
+  occ_download_import(zip_path)             # read CSV inside
+})
+
+gbif_occ <- dplyr::bind_rows(dl_dfs) %>%
+  dplyr::transmute(
+    taxonKey  = as.numeric(taxonKey),
+    gbif_lat  = as.numeric(decimalLatitude),
+    gbif_lon  = as.numeric(decimalLongitude),
+    eventDate = eventDate
+  ) %>%
+  dplyr::filter(!is.na(taxonKey), !is.na(gbif_lat), !is.na(gbif_lon))
+
+# Split occurrences by taxon for fast lookup
+by_tax <- split(gbif_occ, gbif_occ$taxonKey)
+
+nearest_km <- function(lat, lon, key) {
+  occs <- by_tax[[as.character(key)]]
+  if (is.null(occs) || nrow(occs) == 0) return(NA_real_)
+  d <- geosphere::distHaversine(cbind(lon, lat), cbind(occs$gbif_lon, occs$gbif_lat)) / 1000
+  suppressWarnings(min(d, na.rm = TRUE))
+}
+
+# Compute distance & yes/no match for every row in your original enriched data
+data_gbif_validated <- data_gbif_enriched %>%
+  dplyr::mutate(
+    DistanceMatch_km = purrr::pmap_dbl(
+      list(decimalLatitude, decimalLongitude, taxonKey),
+      \(lat, lon, key) if (any(is.na(c(lat, lon, key)))) NA_real_ else nearest_km(lat, lon, key)
+    ),
+    LocationMatch = dplyr::if_else(!is.na(DistanceMatch_km) & DistanceMatch_km <= buffer_km,
+                                   "Yes", "No", "No")
+  )
+
+# Save results and inspect data
+readr::write_csv(gbif_occ,            "../Data/gbif_download_occurrences_AU.csv")
+readr::write_csv(data_gbif_validated, "../Data/gbif_location_validation_download_AU.csv")
+
+data_gbif_validated %>%
+  dplyr::select(species, taxonKey, decimalLatitude, decimalLongitude, LocationMatch, DistanceMatch_km) %>%
+  head() %>% print(n = Inf)
+
+```
+
+
