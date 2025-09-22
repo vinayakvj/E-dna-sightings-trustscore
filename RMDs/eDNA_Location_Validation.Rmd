@@ -40,8 +40,8 @@ library(rnaturalearth)
 library(rnaturalearthdata)
 library(lwgeom)
 
-# Work from a copy of "data" from  Species_DNA_Completeness.Rmd
-data_gbif <- data
+# Work from a copy of "data" from  Species_DNA_Completeness.Rmd but only include fish/shark species
+data_gbif <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
 
 # Load the GBIF Taxonomy data
 tax_ref <- read_csv("../Data/GBIF_Taxonomy.csv", show_col_types = FALSE) %>%
@@ -68,14 +68,18 @@ write_csv(data_gbif_enriched, "../Data/data_with_genus_dna_pct_and_taxonKey.csv"
 
 ## Map the area of interest (AOI) for all our species
 
-Note that this requires a download through a validated account. Code is currently running using the following information:
-
-* Username: nathrek
-* Email: inbox@nathrek.co
-* Password: 8@B9&M6@B9o*!@6b
+Note that this requires a download through a validated account. Login credentials are stored in the "gbif.creds" file in the code folder.
 
 ```{r}
-Sys.setenv(GBIF_USER="nathrek", GBIF_PWD="8@B9&M6@B9o*!@6b", GBIF_EMAIL="inbox@nathrek.co")
+gbif_creds <- read.csv("gbif.creds", header=FALSE)
+gbif_u <- gbif_creds[1,2]
+gbif_p <- gbif_creds[3,2]
+gbif_e <- gbif_creds[2,2]
+```
+
+
+```{r}
+Sys.setenv(GBIF_USER=gbif_u, GBIF_PWD=gbif_p, GBIF_EMAIL=gbif_e)
 ```
 
 Polling the GBIF API for location based observations by species row by row quickly hits the API rate limit.
@@ -230,6 +234,91 @@ gg <- ggplot() +
 print(gg)
 ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
 ```
+### Understand and scope the available GBIF data
+
+Initial code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). Code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
+
+Note: It takes about 20 minutes to process the below block so don't run it unless you really need to regenerate the counts of species observations from GBIF.
+
+```{r}
+# Load taxonomy reference file with GBIF taxonKey attached to each species
+tax_ref <- read_csv("../Data/GBIF_Taxonomy.csv", show_col_types = FALSE)
+
+# Build a vector of taxonKeys
+taxa <- tax_ref$taxonKey %>% unique() %>% na.omit() %>% as.character()
+
+# Function: count occurrences of each species in the AOI
+count_one <- function(key, wkt = NULL) {
+  tryCatch({
+    res <- occ_search(taxonKey = key, country = "AU",
+                      hasCoordinate = TRUE,
+                      geometry = wkt,
+                      limit = 0)
+    res$meta$count %||% NA_integer_
+  }, error = function(e) NA_integer_)
+}
+
+pb <- progress_bar$new(
+  total = length(taxa),
+  format = "Counting [:bar] :current/:total (:percent) ETA: :eta",
+  clear = FALSE, width = 70
+)
+
+# Query all taxonKeys
+counts <- vector("integer", length(taxa))
+for (i in seq_along(taxa)) {
+  counts[i] <- count_one(taxa[i], wkt = aoi_wkt)
+  pb$tick()
+}
+
+# Build summary table
+abundance_tbl <- tibble(
+  taxonKey = as.numeric(taxa),
+  gbif_count_AOI = counts
+) %>%
+  left_join(tax_ref %>% select(taxonKey, matchedName), by = "taxonKey") %>%
+  arrange(desc(gbif_count_AOI))
+```
+
+```{r}
+# Basic stats
+summary(abundance_tbl)
+
+# Plot histogram of species observation counts
+ggplot(abundance_tbl, aes(x = gbif_count_AOI)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of GBIF Records per Species in AOI",
+    x = "Number of GBIF records",
+    y = "Number of species"
+  ) +
+  theme_minimal()
+
+
+# Classify species into abundance bins
+abundance_tbl <- abundance_tbl %>%
+  mutate(
+    abundance_class = case_when(
+      is.na(gbif_count_AOI)        ~ "unknown",
+      gbif_count_AOI == 0          ~ "absent",
+      gbif_count_AOI >= 1000       ~ "very_common",
+      gbif_count_AOI >= 200        ~ "common",
+      gbif_count_AOI >= 50         ~ "uncommon",
+      TRUE                         ~ "rare"
+    )
+  )
+
+abundance_tbl %>% count(abundance_class)
+write_csv(abundance_tbl, "../Data/gbif_species_abundance_summary.csv")
+```
+
+```{r}
+abundance_tbl
+```
+
+
+
 
 ## Download the data for all species in the AOI
 
@@ -310,5 +399,7 @@ data_gbif_validated %>%
   head() %>% print(n = Inf)
 
 ```
+
+
 
 

@@ -14,21 +14,190 @@ knitr::opts_chunk$set(echo = TRUE)
 The problems in the data import all relate to column 22 ("neg_cont_type") which isn't used in our analysis but always good to check on import whether there were any issues.
 
 ```{r}
-library(tidyverse)
 library(httr)
 library(jsonlite)
 library(purrr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(progressr)
 
 # Load in the full dataset
 data <- read_csv("../Data/all_voyages.csv")
 problems(data)
 ```
 
+### Explore and understand the data
+
+During later processing in the pipeline it was discovered that there are observations without Genus and Species data and NA value for Species_In_LCA, however there are predictions for genus and species in other columns. Here we explore these observations and then develop a function to process these observations and impute the species information.
+
+```{r}
+# How many rows relate to organisms that aren't fish
+data %>% count(class, sort = TRUE)
+
+# How many rows where there is no Genus but we have a Genus prediction we could back fill?
+data %>% summarise(count = sum(is.na(genus) & !is.na(Genus.prediction)))
+data %>% filter(is.na(genus) & !is.na(Genus.prediction)) %>% head(10)
+
+# How many rows where there is no Species but we have a Species prediction we could back fill?
+data %>% summarise(count = sum(is.na(species) & !is.na(Species.prediction)))
+data %>% filter(is.na(species) & !is.na(Species.prediction)) %>% head(10)
+
+```
+
+The below function(s) are used to complete the genus, species and Species_In_LCA fields. To minimise API calls a local cache is used to store the list of species for each genus.
+
+```{r}
+# Backfill "genus" and "species" columns where there is a prediction
+data <- data %>%
+  mutate(
+    genus   = coalesce(genus, Genus.prediction),
+    species = coalesce(species, Species.prediction)
+  )
+
+data <- data %>% mutate(Species_In_LCA = coalesce(Species_In_LCA, Species.prediction))
+
+# --- Function to obtain LCA from GBIF based on Genus if this field is currently NA ---
+
+gbif_species_in_genus <- function(genus) {
+  bb <- tryCatch(name_backbone(name = genus, rank = "genus"), error = function(e) NULL)
+  
+  if (is.null(bb) || !"usageKey" %in% names(bb) || is.na(bb$usageKey)) {
+    return(NA_character_)
+  }
+  
+  kids <- tryCatch(name_usage(key = bb$usageKey, data = "descendants"), error = function(e) NULL)
+  
+  if (!is.data.frame(kids) || nrow(kids) == 0) return(NA_character_)
+  
+  df <- as_tibble(kids) %>% filter(.data$rank == "SPECIES", .data$class %in% c("Actinopterygii", "Chondrichthyes"))
+  
+  nm <- df$canonicalName
+  nm[is.na(nm) | nm == ""] <- df$scientificName[is.na(nm) | nm == ""]
+  nm <- nm[!is.na(nm) & nm != ""]
+  
+  if (length(nm) == 0) return(NA_character_)
+  
+  paste(unique(nm), collapse = ", ")
+}
+
+# Validate the function is working correctly
+gbif_species_in_genus("Nomeus")      # should return comma-separated fish species
+gbif_species_in_genus("Anas")         # a bird genus → should return NA
+gbif_species_in_genus("Nonsensegenus")# invalid → should return NA
+
+# --- Code to manage the cache of genus data ---
+
+# Load cache if exists, else empty tibble
+.load_gbif_cache <- function(cache_path) {
+  if (file.exists(cache_path)) readRDS(cache_path) else tibble(genus = character(), Species_In_LCA_fill = character())
+}
+
+# Save cache
+.save_gbif_cache <- function(cache_tbl, cache_path) {
+  saveRDS(cache_tbl, cache_path)
+}
+
+# Function to process the genus data to the cache and only update as necessary
+upsert_gbif_genus_cache <- function(genera, cache_path = "gbif_genus_cache.rds",
+                                    show_progress = TRUE) {
+  genera <- unique(genera)
+  cache  <- .load_gbif_cache(cache_path)
+
+  need <- setdiff(genera, cache$genus)
+  if (!length(need)) {
+    return(cache %>% filter(genus %in% genera))
+  }
+
+  # Build the fetching step
+  fetch_block <- function(need_vec) {
+    tibble(genus = need_vec) %>%
+      mutate(Species_In_LCA_fill = map_chr(genus, gbif_species_in_genus))
+  }
+
+  if (isTRUE(show_progress) && requireNamespace("progressr", quietly = TRUE)) {
+    with_progress({
+      p <- progressor(steps = length(need))
+      new_rows <- tibble(genus = need) %>%
+        mutate(Species_In_LCA_fill = map_chr(genus, ~{ p(message = .x); gbif_species_in_genus(.x) }))
+      assign("new_rows", new_rows, inherits = FALSE)
+    })
+  } else {
+    new_rows <- fetch_block(need)
+  }
+
+  # Append & deduplicate (keep the newest non-NA)
+  cache <- bind_rows(cache, new_rows) %>%
+    arrange(genus) %>%
+    group_by(genus) %>%
+    summarise(Species_In_LCA_fill = coalesce(last(na_if(Species_In_LCA_fill, "")),
+                                                    first(Species_In_LCA_fill)),
+              .groups = "drop")
+
+  .save_gbif_cache(cache, cache_path)
+
+  cache %>% filter(genus %in% genera)
+}
+
+# Now process the datafile and update accordingly
+
+# Backfill genus/species from prediction columns
+data <- data %>%
+  mutate(
+    genus   = coalesce(genus, Genus.prediction),
+    species = coalesce(species, Species.prediction),
+    Species_In_LCA = coalesce(Species_In_LCA, Species.prediction) # if you want that shortcut
+  )
+
+# Identify which genera still need Species_In_LCA?
+need_genus <- data %>%
+  filter(is.na(Species_In_LCA), !is.na(genus)) %>%
+  distinct(genus) %>%
+  pull(genus)
+
+# Update cache only for missing genera, then join
+if (length(need_genus)) {
+  genus_cache <- upsert_gbif_genus_cache(need_genus, cache_path = "gbif_genus_cache.rds", show_progress=TRUE)
+  data <- data %>%
+    left_join(genus_cache, by = "genus") %>%
+    mutate(Species_In_LCA = coalesce(Species_In_LCA, Species_In_LCA_fill)) %>%
+    select(-Species_In_LCA_fill)
+}
+
+```
+
+```{r}
+genus_cache
+```
+
+
+### Re-check the data to see that the above code ran correctly
+
+```{r}
+# How many rows relate to organisms that aren't fish
+data %>% count(class, sort = TRUE)
+
+# How many rows where there is no Genus but we have a Genus prediction we could back fill?
+data %>% summarise(count = sum(is.na(genus) & !is.na(Genus.prediction)))
+data %>% filter(is.na(genus) & !is.na(Genus.prediction)) %>% head(10)
+
+# How many rows where there is no Species but we have a Species prediction we could back fill?
+data %>% summarise(count = sum(is.na(species) & !is.na(Species.prediction)))
+data %>% filter(is.na(species) & !is.na(Species.prediction)) %>% head(10)
+
+# How many rows where we have Genus but not Species_In_LCA?
+data %>% summarise(count = sum(!is.na(genus) & is.na(Species_In_LCA)))
+data %>% filter(!is.na(genus) & is.na(Species_In_LCA)) %>% head(10)
+
+```
+
+### Structure the data
 Next subset the data to only the columns we need
 
 ```{r}
 keep_columns <- c("ASV","sample","assay_name","Assay","count",
-                  "genus","species","Species_In_LCA","X.ID",
+                  "class","order","family","genus","species","Species_In_LCA","X.ID",
                   "ASV_sequence","decimalLongitude","decimalLatitude")
 data <- data[,keep_columns]
 str(data)
@@ -58,60 +227,138 @@ data <- data %>% relocate(Assay_Length, .after = 4)
 ```{r}
 str(data)
 ```
-
 ## eDNA Completeness Data Import
 
-```{r}
-# Load in DNA sequence counts for each region
-NW_12S <- read_csv("../Data/Marine fish_Miya_12S_Northwest Australian Shelf.csv")
-SW_12S <- read_csv("../Data/Marine fish_Miya_12S_Southwest Australian Shelf.csv")
-WC_12S <- read_csv("../Data/Marine fish_Miya_12S_West Central Australian Shelf.csv")
+These CSVs are downloaded from https://shiny.cefe.cnrs.fr/GAPeDNA/ based on the following selections:
 
-NW_16S <- read_csv("../Data/Marine fish_DiBattista_16S_Northwest Australian Shelf.csv")
-SW_16S <- read_csv("../Data/Marine fish_DiBattista_16S_Southwest Australian Shelf.csv")
-WC_16S <- read_csv("../Data/Marine fish_DiBattista_16S_West Central Australian Shelf.csv")
-```
+* Taxon: Marine Fish
+* Resolution: Provinces
+* Mitochondrial Position: 12S + Primer Pair: Miya_12S
+* Mitochondrial Position: 16S + Primer Pair: DiBattista_16S
 
-### Merge 12S
+Note: Client uses Berry_16S but that isn't an available filter. DiBattista appears to have the best coverage of the available primer pairs for 16S analysis so an assumption is made that this will provide sufficient estimation of comparable Berry_16S coverage.
+
+### Provide CSV inputs
 
 ```{r}
-# Merge the 12S datafiles and then check to see if the sequenced value is consistent across regions
+# Manually enter regions exactly as they appear in the filenames
+regions <- c(
+  "East Central Australian Shelf",
+  "Northeast Australian Shelf",
+  "Northwest Australian Shelf",
+  "Sahul Shelf",
+  "Southeast Australian Shelf",
+  "Southwest Australian Shelf",
+  "West Central Australian Shelf"
+)
 
-# Select only the species and Sequenced columns, renaming Sequenced to match region
-NW_12S <- NW_12S %>% select(Species, Sequenced) %>% rename(Northwest = Sequenced)
-SW_12S <- SW_12S %>% select(Species, Sequenced) %>% rename(Southwest = Sequenced)
-WC_12S <- WC_12S %>% select(Species, Sequenced) %>% rename(WestCentral = Sequenced)
+# Directory containing the CSVs
+data_dir <- "../Data"
 
-# Join all three data frames by Species
-merged_data_12S <- NW_12S %>%
-  full_join(SW_12S, by = "Species") %>%
-  full_join(WC_12S, by = "Species")
+# Filename templates for each assay
+templates <- list(
+  `12S` = "Marine fish_Miya_12S_%s.csv",
+  `16S` = "Marine fish_DiBattista_16S_%s.csv"
+)
 
-# Reorder so Species is the first column
-merged_12S_coverage <- merged_data_12S %>% relocate(Species, .before = 1)
-
-head(merged_12S_coverage)
-```
-```{r}
-# Check to see whether there are any conflicts i.e. rows with both yes and no
-conflicts <- merged_12S_coverage %>%
-  rowwise() %>%
-  filter(any(c_across(-Species) == "Yes", na.rm = TRUE) &
-         any(c_across(-Species) == "No",  na.rm = TRUE)) %>%
-  ungroup()
-
-if (nrow(conflicts) == 0) {
-  message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
-} else {
-  message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
-  print(conflicts)
+# Function to simplify region names
+clean_name <- function(x) {
+  x <- gsub("Australian|Shelf", "", x, ignore.case = TRUE)
+  x <- gsub("\\s+", "", x)
+  make.names(x)
 }
+
+
+```
+
+### Process and join the CSV files
+
+```{r}
+
+merge_csvs <- function(assay=NULL, regions=NULL, data_dir=NULL, templates=NULL) {
+  
+  # Get filename template for the assay type and sanity-check it
+  template <- templates[[assay]]
+  if (is.null(template)) {
+    stop(sprintf("Assay '%s' not found in 'templates'.", assay))
+  }
+  if (!grepl("%s", template, fixed = TRUE)) {
+    stop(sprintf("Template for assay '%s' must include '%%s' for the region name.", assay))
+  }
+
+  # Build file paths for regions
+  files <- file.path(data_dir, sprintf(template, regions))
+
+  # Process column labels
+  region_labels <- vapply(regions, clean_name, character(1))
+
+  # Check existence and report any missing files clearly
+  if (any(!file.exists(files))) {
+    missing <- files[!file.exists(files)]
+    stop("These files do not exist:\n", paste(missing, collapse = "\n"))
+  }
+
+  # Read -> select -> rename for each region, then full-join by Species
+  df_list <- map2(files, region_labels, function(path, col_label) {
+    read_csv(path, show_col_types = FALSE) %>%
+      select(Species, Sequenced) %>%
+      rename(!!col_label := Sequenced)
+  })
+
+  merged <- reduce(df_list, ~ full_join(.x, .y, by = "Species")) %>%
+    relocate(Species, .before = 1)
+
+  merged
+}
+
+# 12S merged coverage (Species + one column per region)
+merged_12S_coverage <- merge_csvs("12S", regions, data_dir, templates)
+head(merged_12S_coverage)
+
+# 16S merged coverage
+merged_16S_coverage <- merge_csvs("16S", regions, data_dir, templates)
+head(merged_16S_coverage)
+
+```
+
+
+### Validate rows
+
+```{r}
+check_conflicts <- function(merged_df) {
+  conflicts <- merged_df %>%
+    rowwise() %>%
+    filter(
+      any(c_across(-Species) == "Yes", na.rm = TRUE) &
+      any(c_across(-Species) == "No",  na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  if (nrow(conflicts) == 0) {
+    message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
+  } else {
+    message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
+    print(conflicts)
+  }
+
+  invisible(conflicts)
+}
+
+# Check conflicts for 12S
+conflicts_12S <- check_conflicts(merged_12S_coverage)
+
+# Check conflicts for 16S
+conflicts_16S <- check_conflicts(merged_16S_coverage)
 
 ```
 
 ```{r}
 # Split the "Species" column as it actually contains Genus and Species together
 merged_12S_coverage <- merged_12S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+
+merged_16S_coverage <- merged_16S_coverage %>%
   rename(genus_species = Species) %>%
   separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
 ```
@@ -119,119 +366,57 @@ merged_12S_coverage <- merged_12S_coverage %>%
 Checking the warning rows to see what's happened. Looks like the species name is duplicated in most cases and in a small number of others it's a subspecies. Searching for these sub species on Obis.org they're not classed as valid (i.e. https://obis.org/taxon/236453) so the parent species should be sufficient for our needs.
 
 ```{r}
-problem_rows <- merged_12S_coverage %>%
-  filter(grepl("_.*_", genus_species))
+problem_rows_12 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
+problem_rows_16 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
 
 # Inspect them
-print(problem_rows)
+print(problem_rows_12)
+print(problem_rows_16)
 ```
 
-### Merge 16S
+
+## Calculate species DNA coverage across all regions
 
 ```{r}
-# Merge the 16S datafiles and then check to see if the sequenced value is consistent across regions
+calc_genus_coverage <- function(merged_df, region_cols = NULL) {
+  # If no region_cols are provided, use all except Species and Genus
+  if (is.null(region_cols)) {
+    region_cols <- setdiff(names(merged_df), c("Species", "Genus"))
+  }
 
-# Select only the species and Sequenced columns, renaming Sequenced to match region
-NW_16S <- NW_16S %>% select(Species, Sequenced) %>% rename(Northwest = Sequenced)
-SW_16S <- SW_16S %>% select(Species, Sequenced) %>% rename(Southwest = Sequenced)
-WC_16S <- WC_16S %>% select(Species, Sequenced) %>% rename(WestCentral = Sequenced)
+  # Add AllRegions column
+  merged_df <- merged_df %>%
+    rowwise() %>%
+    mutate(
+      AllRegions = if_else(
+        any(c_across(all_of(region_cols)) == "Yes", na.rm = TRUE),
+        "Yes",
+        "No"
+      )
+    ) %>%
+    ungroup()
 
-# Join all three data frames by Species
-merged_data_16S <- NW_16S %>%
-  full_join(SW_16S, by = "Species") %>%
-  full_join(WC_16S, by = "Species")
+  # Summarise per Genus
+  genus_summary <- merged_df %>%
+    group_by(Genus) %>%
+    summarise(
+      TotalSpecies = n(),
+      YesCount = sum(AllRegions == "Yes"),
+      ProportionYes = YesCount / TotalSpecies,
+      .groups = "drop"
+    ) %>%
+    arrange(Genus)
 
-# Reorder so Species is the first column
-merged_16S_coverage <- merged_data_16S %>% relocate(Species, .before = 1)
-
-head(merged_16S_coverage)
-
-# Check to see whether there are any conflicts i.e. rows with both yes and no
-conflicts <- merged_12S_coverage %>%
-  rowwise() %>%
-  filter(any(c_across(-Species) == "Yes", na.rm = TRUE) &
-         any(c_across(-Species) == "No",  na.rm = TRUE)) %>%
-  ungroup()
-
-if (nrow(conflicts) == 0) {
-  message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
-} else {
-  message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
-  print(conflicts)
+  genus_summary
 }
 
-# Split the "Species" column as it actually contains Genus and Species together
-merged_16S_coverage <- merged_16S_coverage %>%
-  rename(genus_species = Species) %>%
-  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+genus_summary_12S <- calc_genus_coverage(merged_12S_coverage)
+genus_summary_16S <- calc_genus_coverage(merged_16S_coverage)
 
-problem_rows <- merged_16S_coverage %>%
-  filter(grepl("_.*_", genus_species))
-
-# Inspect them
-print(problem_rows)
 ```
 
-## Calculate species DNA coverage across all 3 regions
 
-### 12S
-
-```{r}
-# Create a yes/no record across all 3 regions
-merged_12S_coverage <- merged_12S_coverage %>%
-  rowwise() %>%
-  mutate(
-    AllRegions = if_else(
-      any(c_across(c(Northwest, WestCentral, Southwest)) == "Yes", na.rm = TRUE),
-      "Yes",
-      "No"
-    )
-  ) %>%
-  ungroup()
-
-# Calculate DNA coverage per species
-genus_summary_12S <- merged_12S_coverage %>%
-  group_by(Genus) %>%
-  summarise(
-    TotalSpecies = n(),
-    YesCount = sum(AllRegions == "Yes"),
-    ProportionYes = YesCount / TotalSpecies
-  ) %>%
-  arrange(Genus)
-
-# View results
-print(genus_summary_12S)
-```
-
-### 16S
-
-```{r}
-# Create a yes/no record across all 3 regions
-merged_16S_coverage <- merged_16S_coverage %>%
-  rowwise() %>%
-  mutate(
-    AllRegions = if_else(
-      any(c_across(c(Northwest, WestCentral, Southwest)) == "Yes", na.rm = TRUE),
-      "Yes",
-      "No"
-    )
-  ) %>%
-  ungroup()
-
-# Calculate DNA coverage per species
-genus_summary_16S <- merged_16S_coverage %>%
-  group_by(Genus) %>%
-  summarise(
-    TotalSpecies = n(),
-    YesCount = sum(AllRegions == "Yes"),
-    ProportionYes = YesCount / TotalSpecies
-  ) %>%
-  arrange(Genus)
-
-# View results
-print(genus_summary_16S)
-```
-## Merge the 16S and 12S dataframes to compare
+### Merge the 16S and 12S dataframes to compare
 
 ```{r}
 # Rename columns to avoid problems when merging
@@ -340,8 +525,6 @@ str(data)
 
 ```{r}
 write_csv(data, "../Data/data_with_genus_dna_pct.csv")
-data2000 <- data[1:2000,]
-write_csv(data2000, "../Data/data_with_genus_dna_pct_n2000.csv")
 ```
 
 ## Build a list of unique Genus / Species pairs in the datafile
@@ -355,4 +538,6 @@ genus_species <- genus_species %>% filter(!is.na(Genus))
 genus_species <- genus_species %>% filter(Genus != "dropped")
 genus_species <- genus_species[,c("Genus","Species","genus_species")]
 genus_species
+write_csv(genus_species, "../Data/observed_genus_species.csv")
 ```
+

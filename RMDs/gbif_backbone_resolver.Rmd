@@ -17,6 +17,7 @@ This speeds up processing and minimises API calls by storing this information lo
 The resulting dataframe is then exported to "GBIF_Taxonomy.csv" which can then be imported and used in other scripts
 If "GBIF_Taxonomy.csv" already exists in "../Data/" then it will only add new species which are in the imported datafile but not GBIF_Taxonomy.csv to minimise unnecessary processing
 
+
 ```{r}
 library(dplyr)
 library(stringr)
@@ -26,7 +27,10 @@ library(tidyr)
 library(rgbif)
 library(progress)
 library(tibble)
+```
 
+
+```{r}
 # Function to deal with any empty fields returned by the API
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
@@ -107,7 +111,8 @@ resolve_species_backbone <- function(species_vec,
   final <- bind_rows(existing %||% tibble(), new_rows) %>%
     filter(species_input %in% species_vec) %>%
     distinct(species_input, .keep_all = TRUE) %>%
-    arrange(species_input)
+    arrange(species_input) %>%
+    filter(matchRank %in% c("SPECIES", "GENUS")) # Important to filter only those where there is a species or genus match else it causes data download explosion later if it steps up to family level
 
   write_csv(final, out_csv)
   message("Wrote taxonomy reference: ", normalizePath(out_csv))
@@ -116,6 +121,7 @@ resolve_species_backbone <- function(species_vec,
 
 # Run the script
 df_in <- read_csv("../Data/data_with_genus_dna_pct.csv", show_col_types = FALSE)
+df_in <- df_in %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
 species_vec <- extract_unique_species(df_in, "Species_In_LCA")
 taxonomy <- resolve_species_backbone(
   species_vec,
