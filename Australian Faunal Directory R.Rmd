@@ -1,0 +1,176 @@
+---
+title: "Australian Faunal Directory"
+author: "Ray Stokes"
+date: "2025-09-20"
+output: html_document
+---
+
+
+Apparently a lot of the information from the Australian Faunal Directory (AFD) are from the Atlas of Living Australia, or similarly, databases from the AFD are easy to access from the Atlas of Living Australia. 
+
+
+
+# Atlas of Living Australia
+
+The species page for the Atlas of Living Australia can look a bit like Wikipedia page, with a large amount of textual information. For an example, see:
+
+https://bie.ala.org.au/species/https://biodiversity.org.au/afd/taxa/f308a791-3721-4010-87ec-a61868b6ab79
+
+To use this data, we would require LLMs, but there are other sources we can use from the Atlas of Living Australia, for example, the R package tool 'galah'
+
+
+## Galah
+
+The main link to galah is here: https://galah.ala.org.au/  
+galah has both R and python versions. The R version is here: https://galah.ala.org.au/R/
+
+
+First install the package: install.packages("galah"). It seems bigger than some of the other packages, it takes about a minute to download. Then the library can be loaded
+
+```{r}
+library(galah)
+```
+
+
+To use most of the querying from R, you may need to make an account using your email address. 
+
+First, lets download the data from the client, which will take a few minutes. 
+
+```{r}
+data = read.csv("all_voyages.csv")
+```
+
+
+```{r}
+head(data)
+```
+
+
+Lets limit the dataset to a smaller subset so that more operations can be performed. We will select a few rows with unique species, and take the genus, family and other levels, as well as the lattitude and longitude. 
+```{r}
+sample_data = data[c(1,206,261,271,281,284,287,303,314),c(5,6,7,8,9,10,12,29,30)]
+sample_data
+```
+
+
+
+One example of a function you can use in galah is the 'search_taxa' function, which provides some information about the species/genus/family or higher level that you choose. 
+
+```{r}
+search_taxa("reptilia")
+```
+
+
+```{r}
+search_taxa(c("Chordata",	"Actinopterygii"))
+```
+
+
+### Searching for matches
+
+
+You need to register your email to use most of the galah queries, and configure it using 'galah_config'. Below, we are searching for the genus 'Auxis', which is the first one that appears in the dataset:
+
+
+```{r}
+galah_config(email = "24423873@student.uwa.edu.au")
+
+galah_call() |>
+  galah_identify("Auxis") |>
+  atlas_occurrences()
+```
+
+
+We can also filter the results so they are more relevant. For example, filtering so that only entries after the year 2000 show up
+
+```{r}
+galah_results <-
+galah_call() |>
+  galah_identify("Auxis") |>
+  galah_filter(year > 2000)|>
+  atlas_occurrences()
+```
+
+The results are as below:
+
+```{r}
+head(galah_results)
+```
+
+
+```{r}
+names(galah_results)
+```
+
+### Visualising Sightings at different times 
+
+Now we can create a new column that helps us order the results by time. 
+
+```{r}
+galah_results$ranked_time = rank(galah_results$eventDate,na.last = "keep")
+galah_results$ranked_time = galah_results$ranked_time/max(galah_results$ranked_time,na.rm = TRUE)
+head(galah_results[,c('eventDate','ranked_time')],10)
+```
+
+
+Next, we want to create colours for the plots, with most recent events being in red, while older events are faded red, and NA values are yellow
+
+```{r}
+colours_column = c()
+
+na_colour = rgb(0.9,0.9,0.4,0.3)
+base_colour_red = 1
+base_colour_green = 0
+base_colour_blue =  0
+
+for (i in 1:nrow(galah_results))
+{
+  if (!is.na(galah_results$ranked_time[i]))
+  {
+    colours_column = c(colours_column,rgb(base_colour_red,base_colour_green,base_colour_blue,
+                                          alpha=(galah_results$ranked_time[i]+0.9)^2/1.9^2)) #qudratic scaling
+  }
+  else
+  {
+    colours_column = c(colours_column,na_colour)
+  }
+  
+}
+galah_results$col <-colours_column
+```
+
+
+
+Extract an example row from the data:
+
+```{r}
+auxis <- sample_data[1,]
+auxis
+```
+
+
+Add the relevant fields from our data to the data from the AFD retrieved using galah:
+
+```{r}
+# Join so they can both be plotted on ggplot:
+auxis_joined <- auxis[c("decimalLongitude","decimalLatitude")]
+auxis_joined$col <- rgb(0,0,1,1)
+auxis_joined <- rbind(auxis_joined,galah_results[c("decimalLongitude","decimalLatitude","col")])
+head(auxis_joined)
+```
+
+
+```{r}
+# Plot the sighting
+ggplot(auxis_joined, aes(x = decimalLongitude, y = decimalLatitude)) +
+  borders("world", colour = "gray50", fill = "gray80") +
+  geom_point(colour =auxis_joined$col, size = 3) +
+  labs(title = "Sightings of Auxis in Australia", x = "Longitude", y = "Latitude") +
+  theme_minimal() + 
+  coord_cartesian(xlim = c(75, 200), ylim = c(-50, 25))
+  
+```
+Where the blue point is from the client dataset, the red points are recent, yellow are unknown time records. 
+
+
+
