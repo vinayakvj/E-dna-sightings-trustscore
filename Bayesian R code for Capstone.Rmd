@@ -116,7 +116,7 @@ eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigm
                 mu_aq = p_location, sigma_aq = 1/sigma_location^2),
               inits = NULL, 
               n.chains = 4, n.iter = 11000, n.burnin = 1000,
-              parameters.to.save = c("posterior,S,ID,RD,AQ,AN,G"),
+              parameters.to.save = c("posterior","S","ID","RD","AQ","AN","G"),
               model.file = "OpenBUGS_eDNA.txt",
               DIC = FALSE, codaPkg = TRUE)
   } else{
@@ -140,7 +140,7 @@ eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigm
   
   if (show_stats)
   {
-    summary(codaobj)
+    print(summary(codaobj))
   }
   
   if (show_density)
@@ -184,10 +184,11 @@ n_genus_location = 44
 show_trace=F
 show_density=T
 show_stats=T
-show_all_vars=F
+show_all_vars=T
+
 
 test_probs = eDNA_OpenBUGS(p_species, n_species, p_reads, sigma_reads, p_ID, sigma_ID, p_location, sigma_location,  
-                          p_assay, sigma_assay, p_genus_location, n_genus_location, show_trace=F, show_density=T,show_stats=T,show_all_vars=F)
+                          p_assay, sigma_assay, p_genus_location, n_genus_location, show_trace=show_trace, show_density=show_density,show_stats=show_stats,show_all_vars=show_all_vars)
 ```
 
 
