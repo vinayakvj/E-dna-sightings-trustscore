@@ -1,0 +1,74 @@
+---
+title: "Merge Species Counts"
+author: "Nathan Reed (24110024)"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is a small script to merge the file "OceanGenomes.CuratedNT.NBDLTranche1and2and3.CuratedBOLD.species_counts.tsv" (provided by the client), which is a count of DNA records for each species with our main data file. These DNA counts will be used as part of the Bayesian Analysis predicting whether an eDNA match is likely to be accurate. 
+
+Caveats of this data, as provided by the client:
+
+* some of those species counts are entire mitogenomes (so 12S + 16S + COI + everything....), some are only partial sequences (so only 12S, or only 16S etc.). So it may not be a 100% accurate count if you, say, want to know the number of 16S you might slightly inflate the numbers.
+
+We will use this data as a proxy measure of species DNA robustness whereby a large value is taken to mean a species has had its DNA encoded many, many times and therefore there is consensus in online databases as to the DNA of that species while a species with a very low number of DNA records means there is a potential for false matches for that species as there is limited understanding of within species DNA variation as there are very few available DNA samples of the species.
+
+
+```{r cars}
+library(readr)
+library(dplyr)
+
+# Import GBIF enriched datafile that has already been processed through GBIF_Data_Extraction.Rmd
+data <- read_csv("../Data/data_GBIF_enriched.csv")
+gbif <- read_csv("../Data/GBIF_Taxonomy.csv")
+tsvcolnames <- c("Species","DNA_Counts")
+dna_counts <- read_tsv("../Data/OceanGenomes.CuratedNT.NBDLTranche1and2and3.CuratedBOLD.species_counts.tsv", col_names=tsvcolnames)
+
+# Inspect data distribution
+dna_counts
+hist(dna_counts$DNA_Counts)
+hist(log10(dna_counts$DNA_Counts))
+
+# Bucket into 10 equal sized groups
+dna_counts$DNA_Q10 <- ntile(dna_counts$DNA_Counts, 10) 
+table(dna_counts$DNA_Q10, useNA = "ifany")
+
+# See what the typical value is of each bucket
+stats_q10 <- dna_counts %>%
+  group_by(DNA_Q10, .drop = FALSE) %>%   # keeps empty buckets if factor
+  summarise(
+    n      = dplyr::n(),
+    mean   = mean(DNA_Counts, na.rm = TRUE),
+    median = median(DNA_Counts, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_q10
+
+# Manually split the groups based on the distribution of DNA counts
+dna_counts$DNA_availability <- with(dna_counts, case_when(
+  DNA_Counts <=5  ~ "Very limited (5)",
+  DNA_Counts <=20 ~ "Limited (20)",
+  DNA_Counts <=50 ~ "Many (50)",
+    TRUE ~ "Abundant (>50)"
+))
+
+dna_counts
+
+# Join back with the GBIF_Taxonomy.csv file
+gbif <- gbif %>% left_join(dna_counts, by = c("species_input" = "Species"))
+gbif
+
+# Join GBIF data and DNA counts back to the main datafile
+data <- data %>% left_join(gbif %>% select(taxonKey, gbif_count_AOI, abundance_class, DNA_Counts, DNA_availability),
+    by = "taxonKey")
+
+write_csv(data, "../Data/data_GBIF_DNA_enriched.csv")
+
+```
