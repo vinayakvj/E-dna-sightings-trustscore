@@ -9,9 +9,38 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Code overview
+# Introduction
 
-asdf
+This markdown file uses the GBIF API to extract a variety of information and uses it to enrich our original dataset. The main components / processes are:
+
+1. Data processing / preparation
+
+  * Cleanup and structure the data
+  * Generate a unique species list and matching taxonKey to enable efficient calls to the GBIF API
+
+2. Location calculations
+
+  * Create an "Area of Interest" (AOI) mapped to the locations of all eDNA samples
+  * Download species observation data from GBIF from within the AOI
+  * Measure the distance between an eDNA sample and the nearest recorded observation of that species
+
+3. Species DNA availability
+
+  * Download data relating to the availability of DNA matches for each species and assay types
+  * Calculate a  per genus DNA catalogue value representing how well that genus is covered in online DNA databases
+  
+  
+## Important notes and considerations
+
+ * This markdown file has been provided to enable thorough examination of our approach and processes, with a focus on GBIF. For day to day client use a singular .R script file will also be provided that does not contain the same level of commentary, exploration and visualisations.
+ 
+ * Some components of this script require downloads that can take many hours. Where possible local caches of files are retained and scripts only download incremental updates, however care should be take to read instructions and skip code blocks that will result in unnecessary duplication of downloads.
+ 
+ * Some libraries may require additional OS installs. i.e. Ubuntu 24.04 LTS requires:
+
+    * libudunits2 as a dependency of the SF library from Cran (sudo apt install libudunits2-dev) 
+    * GDAL, GEOS, PROJ, netcdf, sqlite3 and tbb as dependencies of the RSpatial library from CRAN (sudo apt-get install libgdal-dev gdal-bin libgeos-dev libproj-dev libtbb-dev libnetcdf-dev)
+
 
 # Load data and libraries
 
@@ -42,7 +71,7 @@ problems(data)
 ```
 
 ## Cleanup and structure the data
-Next subset the data to only the columns we need
+Next subset the data to only the columns we need and limit observations to ray-finned and cartilaginous fish as the client does not require information about other classes of animals such as birds and mammals.
 
 ```{r}
 keep_columns <- c("ASV","sample","assay_name","Assay","count",
@@ -57,7 +86,7 @@ data <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
 
 ## Assay variables
 
-There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use.
+There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use as it does not contain any NA values.
 
 ```{r}
 table(data$Assay, useNA="always")
@@ -78,7 +107,7 @@ str(data)
 
 # Generate Species list and taxonKey for easier GBIF API access
 
-## Function for processing data to extract unique species
+## Function for processing data to extract unique species list
 
 ```{r}
 # Function to deal with any empty fields returned by the API
@@ -113,7 +142,7 @@ resolve_one <- function(name) {
 
 # Process all species and export to GBIF_Taxonomy.csv
 resolve_species_backbone <- function(species_vec,
-                                     out_csv = "GBIF_Taxonomy.csv",
+                                     out_csv = "../Data/GBIF_Taxonomy.csv",
                                      overwrite = FALSE,
                                      polite_pause = 0) {
   species_vec <- unique(str_squish(as.character(species_vec)))
@@ -171,7 +200,12 @@ resolve_species_backbone <- function(species_vec,
 }
 
 ```
+
 ## Run the script and then join to main dataframe
+
+Note that this update is incremental. If GBIF_Taxonomy.csv already exists in the "../Data/" directory then it will only add new species that are listed in the local "data" dataframe but not currently in "../Data/GBIF_Taxonomy.csv".
+
+If GBIF_Taxonomy.csv does not exist then it will be generated and this process takes between 20 and 30 minutes depending on the number of unique species in the "data" dataframe.
 
 ```{r}
 
@@ -302,6 +336,9 @@ print(suss_longitudes)
 data_lon200 <- read_csv("../Data/all_voyages.csv")
 data_lon200 <- data_lon200 %>% filter(decimalLongitude > 200)
 write_csv(data_lon200, "../Data/all_voyages_lon200.csv")
+
+# Filter data to remove invalid Longitudes
+data <- data %>% filter(decimalLongitude < 200)
 ```
 
 ### Refit our AOI with rows containing invalid location data removed
@@ -371,15 +408,19 @@ ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
 
 ## Understand and scope the available GBIF location observation data
 
-Initial code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). Code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
+Early iterations of our code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). The code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
 
-Note: It takes about 20 minutes to process the below block so don't run it unless you really need to regenerate the counts of species observations from GBIF.
+These raw counts of species observations also provide us with a proxy measure of species abundance with common / high population species expected to have high observation counts compared with rare / low population species.
+
+**NOTE:** It takes about 20 minutes to process the below block. **DO NOT RUN** unless you need to regenerate the counts of species observations from GBIF. I've added a flag to this code block "taxon_count_rebuild" and set to FALSE. This will stop the download happening unless you change this flag to TRUE.
 
 ### Obtain counts of observations for each species within the AOI
 
 ```{r}
 # Build a vector of taxonKeys
 taxa <- taxonomy$taxonKey %>% unique() %>% na.omit() %>% as.character()
+
+taxon_count_rebuild = FALSE
 
 # Function: count occurrences of each species in the AOI
 count_one <- function(key, wkt = NULL) {
@@ -399,34 +440,30 @@ pb <- progress_bar$new(
 )
 
 # Query all taxonKeys
-counts <- vector("integer", length(taxa))
-for (i in seq_along(taxa)) {
-  counts[i] <- count_one(taxa[i], wkt = aoi_wkt)
-  pb$tick()
+
+if (taxon_count_rebuild==TRUE) {
+  counts <- vector("integer", length(taxa))
+  for (i in seq_along(taxa)) {
+    counts[i] <- count_one(taxa[i], wkt = aoi_wkt)
+    pb$tick()
+  }
+  
+  # Build summary table if it hasn't been down before or if there is fresh downloaded data
+  abundance_tbl <- tibble(taxonKey = as.numeric(taxa), gbif_count_AOI = counts) %>%
+    left_join(taxonomy %>% select(taxonKey, matchedName), by = "taxonKey") %>%
+    arrange(desc(gbif_count_AOI))
+  
+  abundance_tbl <- unique(abundance_tbl)
+  
+  # Write counts out to file so they can be restored easily instead of running this code block every time
+  write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
 }
 
-```
-
-### Build a summary table of the counts 
-
-```{r}
-# Build summary table
-abundance_tbl <- tibble(
-  taxonKey = as.numeric(taxa),
-  gbif_count_AOI = counts
-) %>%
-  left_join(taxonomy %>% select(taxonKey, matchedName), by = "taxonKey") %>%
-  arrange(desc(gbif_count_AOI))
-
-abundance_tbl <- unique(abundance_tbl)
-
-# Write counts out to file so they can be restored easily instead of running this code block every time
-write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
-
-# Re-import counts
+# Re-import counts if they already exist
 abundance_tbl <- read_csv("../Data/taxonKey_Observation_Counts.csv")
 
 ```
+
 
 ```{r}
 # Basic stats
@@ -497,9 +534,9 @@ write_csv(gbif_joined, "../Data/GBIF_Taxonomy.csv")
 
 ```
 
-# Download species observation data
+## Download species observation data
 
-## Function to extract observation data from AOI by species
+### Function to extract observation data from AOI by species
 
 ```{r}
 # Extract Taxon keys from GBIF_Taxonomy
@@ -664,10 +701,76 @@ if (length(files) > 0) {
 
 ```
 
-## Merge individual species records into a master datafile of all observations
+## Compare sample Lat/Lon to GBIF species observations
 
 ```{r}
+# ---- Settings ---------------------------------------------------------------
+obs_dir <- "../Data/SpeciesObservations"   # where taxonKey CSVs live
+sample_lat_col <- "decimalLatitude"        # Name of latitude column
+sample_lon_col <- "decimalLongitude"       # Name of longitude column
+.obs_cache <- new.env(parent = emptyenv()) # Cache each taxon in memory
 
+
+# ---- Function to load CSVs and compare lat/lon values -----------------------
+get_obs_points <- function(taxon_key) {
+  if (is.na(taxon_key)) return(NULL)
+  key <- as.character(taxon_key)
+
+  if (exists(key, envir = .obs_cache, inherits = FALSE))
+    return(get(key, envir = .obs_cache, inherits = FALSE))
+
+  path <- file.path(obs_dir, paste0(key, ".csv"))
+  if (!file.exists(path)) return(NULL)
+
+  obs <- read_csv(
+    path,
+    col_types = cols(
+      .default = col_skip(),
+      decimalLongitude = col_double(),
+      decimalLatitude  = col_double()
+    ),
+    show_col_types = FALSE
+  ) |>
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) |>
+    distinct(decimalLongitude, decimalLatitude)
+
+  if (nrow(obs) == 0) return(NULL)
+
+  pts <- as.matrix(obs[, c("decimalLongitude", "decimalLatitude")])  # [lon, lat]
+  assign(key, pts, envir = .obs_cache)
+  pts
+}
+
+nearest_obs_distance_m <- function(sample_lat, sample_lon, taxon_key) {
+  if (is.na(sample_lat) || is.na(sample_lon) || is.na(taxon_key)) return(NA_real_)
+  pts <- get_obs_points(taxon_key)
+  if (is.null(pts)) return(NA_real_)
+  ref <- c(sample_lon, sample_lat)                 # distHaversine expects [lon, lat]
+  min(distHaversine(pts, ref))
+}
+
+# ---- Apply to data frame ----------------------------------------------
+# Create new column with distance from sample to nearest observation in metres
+data <- data |>
+  mutate(
+    nearest_obs_m = mapply(
+      nearest_obs_distance_m,
+      .data[[sample_lat_col]],
+      .data[[sample_lon_col]],
+      taxonKey
+    )
+  )
+
+# Create new boolean columns where TRUE if nearest distance is within 20km / 50km / 100km
+data$nearest_obs_20km <- data$nearest_obs_m < 20000
+data$nearest_obs_50km <- data$nearest_obs_m < 50000
+data$nearest_obs_100km <- data$nearest_obs_m < 100000
+
+```
+
+```{r}
+str(data)
+summary(data)
 ```
 
 
@@ -961,5 +1064,5 @@ str(data)
 ### Export out to CSV for use in other scripts
 
 ```{r}
-write_csv(data, "../Data/data_with_genus_dna_pct.csv")
+write_csv(data, "../Data/data_GBIF_enriched.csv")
 ```
