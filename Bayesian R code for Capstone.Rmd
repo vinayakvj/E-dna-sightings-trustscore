@@ -12,11 +12,11 @@ output:
 
 # Equations
 
-As a reminder, the main Bayesian equation for this project is:
+As a reminder, the main Bayesian equation for this project WAS:
 
 $$P(S | ID,AQ,RD,AN) =  \frac{P(AQ | S)  P(AN | S)  P(ID | S)  P(RD | S)P(S)}{P(AQ)  P(AN)  P(ID)  P(RD)}$$
 
-Where:  
+Where the variables are:  
 $S$ is the species  
 $ID$ is the percentage ID  
 $RD$ is the read count  
@@ -24,58 +24,77 @@ $AN$ is the assay name
 $AQ$ is the aquamaps probability (probability at that location, doesn't have to be aquamaps. We might be able to rename variable to $L$ if it is clearer)  
 
 
-If we include the genus $G$, this becomes:
+I have altered this slightly by adding some new terms and removing the denominator, so we now have:
 
-$$P(S | G, ID,AQ,RD,AN) =  \frac{P(G|AQ,S)P(AQ | S)  P(AN | S)  P(ID | S)  P(RD | S)P(S)}{P(G|AQ)P(AQ)  P(AN)  P(ID)  P(RD)}$$
-I believe $P(G|AQ,S) = 1$, correct me if I am wrong. If you know the species, you know the genus
+$$f(S |ID, RD, AN, GP, DR, AQ, NT, DI) \propto  f(ID | DR, S)\times f(RD | S) \times  f(AN | S) \times f(GP|S) \times  f(AQ | S) ...$$
+$$...\times f(NT|S) \times f(DI|S) \times f(S)$$
 
-If we don't care about the terms not including $S$, or $G$, then we have:
+Where new term $GP$ is related to the percentage of genus with eDNA in the database, $DR$ is the normalised diversity rate for that species, $NT$ is the number of species found in the target zone (in reference databases) and $DI$ is the closest distance of same species in database to the observation.
 
-$$f(S | G, ID,AQ,RD,AN) \propto  \frac{f(AQ | S)\times f(AN | S)\times f(ID | S)\times f(RD | S) \times f(S)}{f(G|AQ)}$$
 Meaning of the terms:  
 
-$f(S)$ is the proportion of that particular species. Can be either from Phillips list, a database, or all databases (need to choose)  
-$f(AQ | S)$ probability of finding at that location given that we know the species. Would depend on closeness of species in database to that location, and the amount. For example, what proportion of points (where the species was observed) are closer than 10km? Can experiment with different thresholds, e.g 5km, 10km, 20km. **Or, if just using 1 location, can something like a function of 1/distance, e.g logit (still need to choose a threshold)**  
-$f(ID | S)$ is the precision (TP/(TP+FP)), multiplied by % ID. So if 100% ID, it is just the precision  
-$f(RD | S)$ is the number of read counts, perhaps divided by the maximum number of read counts, to make it a proportion  
-$f(AN | S)$ is the value we assign for the assay name, closer to 1 if more trustworthy  
-$f(G|AQ)$ is the proportion of that genus at the location (area of interest, compared to other genus in the area)  
-**Also need to add something about the missing genus/species in the databases (how well the genus is covered in databases**
+-  $f(ID | DR, S)$ is the ID match given the diversity of the species. If a species is more diverse, lower percentage matches are OK. Hence, this alters the match to: $p_{new} = p^{1-d}$ for diversity rate $d$. E.g for a match of 98% but high diversity rate, we can treat this as a 100% match: $0.98^{1-1}=1$  
+-  $f(RD | S)$ probability of match given the number of read counts. Say we have a probability of 0.3 that we pick up a correct DNA match. If we have 10 DNA matches, then the probability that at least 1 is correct is $1 - 0.7^{10} = 0.97$ probability that the species is actually present in the area, so the more counts, the more likely. If we assume there could be some bias (that each count is not independent), then we can be harsher by reducing the count by some factor, meaning $p_{new}=1-p^{b\times counts}$, where $p$ is the prior $p$, distributed uniformly on [0,1], and so is $b$. 
+-  $f(AN | S)$ is the value we assign for the assay name, closer to 1 if more trustworthy 
+-  $f(GP|S)$ is the percentage of species in the genus whose DNA is in the database  
+-  $f(AQ | S)$ is the aqua maps probability of finding the species at that location  
+-  $f(NT|S)$ is the number of species found in the database, using $p_{new}=1-p^{counts}$ for uniform prior $p$, similar to treatment of reads  
+-  $f(DI|S)$ is the probability of species in area, having the closest observation of species in database to the location. This probability will be higher for smaller distances $r$, and is given by: $P = e^{-kr}$. We can choose $k$ so to determine how close you need to be for a good observation. For example, we want to find the distance where the probability is $0.5$:  
+$\frac{1}{2} = e^{-kr} \implies \log(\frac{1}{2}) = -kr \implies \log(2) = kr \implies k=\frac{\log(2)}{r}$. For example, if you want a distance of 100km away to be a 0.5 probability, choose $k=\frac{\log(2)}{100} = 0.006931472$. Don't worry, this will be incorporated into the program so you only need to specify the distance for 0.5 probability.    
+
+For most of the proportions, we will use a Beta distribution as the model.  
+The expected value for a beta distribution with parameters $\alpha$ and $\beta$ is $\frac{\alpha}{\alpha+\beta}$. If we want our beta distribution to have a shape so that the expected value is close to our proportion $p$, then we have to set $\frac{\alpha}{\alpha+\beta} = p$. This means $\beta = \frac{1-p}{p}\alpha$. The higher the value of $\alpha$, the more informative.   
+
+The posterior can also be broken into match based and location based probabilities, which makes it easier to determine how location affects the probability:
 
 
-We can start by trying to model each as a normal distribution with sample proportions with mean $p$ and standard deviation $\sqrt{\frac{\hat{p}(1-\hat{p})}{n}}$. 
-We can update these later as we come up with better distributions for each variable. If we want to work with counts directly, we can view each sighting of the species in the database a 'success' that is 'evidence' we can use for Bayesian inference, e.g binomial, geometric, poisson, etc. 
+$$f(S |ID, RD, AN, GP, DR, AQ, NT, DI) \propto  [f(ID | DR, S)\times f(RD | S) \times  f(AN | S) \times f(GP|S)\times f(S)] ...$$
+$$...\times  [f(AQ | S) \times f(NT|S) \times f(DI|S)]$$
+
+
+This is the same as:
+
+$$f(S|M,L) \propto f(M|S)\times f(L|S)$$
+For match $M$ and location $L$. 
+
+
+
 
 
 
 
 # Main function for Open BUGS:
 
+
 ```{r}
-eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigma_ID, p_location, sigma_location,  
-                          p_assay, sigma_assay, p_genus_location, n_genus_location, show_trace=F, show_density=T,show_stats=T,show_all_vars=F)
+eDNA_OpenBUGS <- function(percent_ID, read_counts, p_assay, diverse_score, percent_genus_db, p_species, p_aquamaps, num_in_area, nearest_distance, distance_for_50_percent=50,
+                          confidence_int=0.95, num_iterations=11000, num_burnin = 1000, show_trace=F, show_all_densities=F,show_posterior_density=T,show_stats=T,debug=F)
 {
+  
   # Given one DNA sample and the relevant data from the same row, including related data from external databases, 
   #  make the distributions in OpenBUGS
   
   # ARGS:
-    # p_species - proportion of that species
-    # n_species - amount of data used (length, more length is stronger evidence)
-    # p_reads - probability given reads
-    # sigma_reads - how much you expect reads to deviate (standard deviation)
-    # p_ID - precision multiplied by percentage match
-    # sigma_ID - expected deviation in p_ID
-    # p_location - probability of species being at that particular location
-    # sigma_location - perceived deviation in location
+    # percent_ID - the percentage match BLAST hit for species, as a decimal (range 0 to 1)
+    # read_counts - the number of counts for the 
     # p_assay - probability score assigned to assay type
-    # sigma_assay - expected deviation in p_assay
-    # p_genus_location - proportion of that genus at the location, compared to other genus
-    # n_genus_location - number of samples/data size used to calculate p_genus_location
+    # diverse_score - normalized diversification score between 0 and 1. 0 means species is not diverse, 1 means highly diverse, DNA constantly changing
+    # percent_genus_db - percentage of species in same genus that have eDNA recorded in databases (as a decimal, range 0 to 1). A high percentage means more likely to be correct
+    # p_species - proportion for the species (incorporates how rare or common it is)
+    # p_aquamaps - aquamaps probability for species at that location
+    # num_in_area - number of species in the general area
+    # nearest_distance - closest distance between observation and another observation of the species in the database
+    # distance_for_50_percent - distance where we assume there is a 0.5 probability of the species being in location
+    # confidence_int - decimal for desired confidence (credible) interval. Default is 0.95 for a 95% confidence interval
+    # num_iterations - number of iterations to use for OpenBUGS simulation. The default is 11000
+    # num_burnin - number of iterations to discard at the start, to let simulation 'warm up'
     # show_trace - whether you want the trace plots to be shown (TRUE/FALSE)
-    # show_density - whether you want the density plots to be shown (TRUE/FALSE)
+    # show_all_densities - whether you want the density plots for each variable to be shown (TRUE/FALSE)
+    # show_posterior_density -  show posterior density plots for location, match and combination of both (overall posterior)
     # show_stats - shows the Bayesian estimates if TRUE
-    # show_all_vars - If you want to see the other variables in the density plots, set to TRUE
-  
+    # debug - TRUE/FALSE, debug in OpenBUGS if wanted
+  # RETURNS:
+    # A data frame with expected values and confidence intervals for match, location and combined posterior probabilities
   
   
   # load libraries. Might be better to load once, from another function instead of loading each time function is called?
@@ -86,66 +105,214 @@ eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigm
   writeLines("
     model{
     
-      S ~ dnorm(mu_s, sigma_s)
-      ID ~ dnorm(mu_id, sigma_id)
-      RD ~ dnorm(mu_rd, sigma_rd)
-      AN ~ dnorm(mu_an, sigma_an)
-      G ~ dnorm(mu_g, sigma_g)
-      AQ ~ dnorm(mu_aq, sigma_aq)
+      # percentage identity and species diversity
+      ID ~ dbeta(a_id, b_id)
+      p_id_dr <- pow( p_i, e) 
+      e <- 1 - dr
+      a_id <- 2
+      b_id <- abs(1 - p_id_dr) / p_id_dr * a_id
       
-      posterior <- S * ID * RD * AN * AQ / G
+      # read counts
+      RD <- 1 - pow( (1 - p_rd), (a_rd * counts) )
+      p_rd ~ dunif(0, 1)
+      a_rd ~ dunif(0, 1)
       
+      # assay prob
+      AN ~ dbeta(a_an, b_an)
+      a_an <- 2
+      b_an <- abs(1 - p_an) / p_an * a_an
+      
+      # Probabity using percentage of recorded genus
+      GP ~ dbeta(a_gp, b_gp)
+      a_gp <- 2
+      b_gp <- abs(1 - p_gp) / p_gp * a_gp
+      
+      # Probability using proportion for species
+      S ~ dbeta(a_s, b_s)
+      a_s <- 2
+      b_s <- abs(1 - p_s) / p_s * a_s
+      
+      # Probability from aquamaps
+      AQ ~ dbeta(a_aq, b_aq)
+      a_aq <- 2
+      b_aq <- abs(1 - p_aq) / p_aq * a_aq
+      
+      # Number of species found in target area
+      NT <- 1 - pow( (1 - p_ta), num_ta)
+      p_ta ~ dunif(0, 1)
+      
+      # Distance to closest observation of species in database
+      DI ~ dbeta(a_di, b_di)
+      a_di <- 2
+      b_di <- abs(1 - p_di) / p_di * a_di
+  
     
     }", con="OpenBUGS_eDNA.txt")
   
-
-
-  # Need to pass all the variables so BUGS can use them. Remember, BUGS uses 1/sigma^2 for its dnorm() function
-  # First find the sigmas from p and n, where applicable
+  # Need to pass all the variables so BUGS can use them. 
+  # Also need to convert distance into a probability so it is compatible
   
-  sigma_species = sqrt(p_species*(1-p_species)/n_species)
-  sigma_genus_location = sqrt(p_genus_location*(1-p_genus_location)/n_genus_location)
-  
-  if (show_all_vars)
+
+  prob_dist = exp(-nearest_distance*log(2) / distance_for_50_percent)
+    
+  # we cannot have any probability 0 or 1, so adjust probabilities slightly
+  Auto_Correct_Probabilities <- function(p)
   {
-    res <- bugs(data=list(mu_s = p_species, sigma_s = 1/sigma_species^2,
-                mu_id = p_ID , sigma_id = 1/sigma_ID^2,
-                mu_rd = p_reads, sigma_rd = 1/sigma_reads^2,
-                mu_an = p_assay, sigma_an = 1/sigma_assay^2,
-                mu_g = p_genus_location, sigma_g = 1/sigma_genus_location^2,
-                mu_aq = p_location, sigma_aq = 1/sigma_location^2),
-              inits = NULL, 
-              n.chains = 4, n.iter = 11000, n.burnin = 1000,
-              parameters.to.save = c("posterior","S","ID","RD","AQ","AN","G"),
-              model.file = "OpenBUGS_eDNA.txt",
-              DIC = FALSE, codaPkg = TRUE)
-  } else{
-    res <- bugs(data=list(mu_s = p_species, sigma_s = 1/sigma_species^2,
-                mu_id = p_ID , sigma_id = 1/sigma_ID^2,
-                mu_rd = p_reads, sigma_rd = 1/sigma_reads^2,
-                mu_an = p_assay, sigma_an = 1/sigma_assay^2,
-                mu_g = p_genus_location, sigma_g = 1/sigma_genus_location^2,
-                mu_aq = p_location, sigma_aq = 1/sigma_location^2),
-              inits = NULL, 
-              n.chains = 4, n.iter = 11000, n.burnin = 1000,
-              parameters.to.save = c("posterior"),
-              model.file = "OpenBUGS_eDNA.txt",
-              DIC = FALSE, codaPkg = TRUE)
+    if (p > 0.9999)
+    {
+      p = 0.9999
+    }else if (p < 0.0001)
+    {
+      p = 0.0001
+    }
+    return(p)
   }
   
-            
-
-
+  percent_ID = Auto_Correct_Probabilities(percent_ID)
+  diverse_score = Auto_Correct_Probabilities(diverse_score)
+  p_assay = Auto_Correct_Probabilities(p_assay)
+  percent_genus_db = Auto_Correct_Probabilities(percent_genus_db)
+  p_species = Auto_Correct_Probabilities(p_species)
+  p_aquamaps = Auto_Correct_Probabilities(p_aquamaps)
+  prob_dist = Auto_Correct_Probabilities(prob_dist)
+  
+  
+  res <- bugs(data=list(p_i = percent_ID, dr = diverse_score, counts =read_counts,
+                          p_an = p_assay, p_gp = percent_genus_db, p_s=p_species, 
+                          p_aq = p_aquamaps, num_ta = num_in_area, p_di = prob_dist),
+              inits = NULL, 
+              n.chains = 4, n.iter = num_iterations, n.burnin = num_burnin,
+              parameters.to.save = c("ID", "RD","AN","GP","S","AQ","NT", "DI"),
+              model.file = "OpenBUGS_eDNA.txt",
+              DIC = FALSE, codaPkg = TRUE,debug=debug)
+  
+  # extract the data
   codaobj <- read.bugs(res, quiet=TRUE)
+  all_distributions <- as.data.frame(as.matrix(codaobj))
+  
+  # Convert each distribution into a density
+  ID = density(all_distributions$ID)
+  RD = density(all_distributions$RD)
+  AN = density(all_distributions$AN)
+  GP = density(all_distributions$GP)
+  S = density(all_distributions$S)
+  AQ = density(all_distributions$AQ)
+  NT = density(all_distributions$NT)
+  DI = density(all_distributions$DI)
+  
+  # Make all plots have the same x-axis range
+  min_x = max(min(ID$x), min(RD$x), min(AN$x), min(GP$x), min(S$x), min(AQ$x), min(NT$x), min(DI$x))
+  max_x = min(max(ID$x), max(RD$x), max(AN$x), max(GP$x), max(S$x), max(AQ$x), max(NT$x), max(DI$x))
+  dx = 0.001
+  x = seq(min_x, max_x, dx)
+  
+  # Override previous plots with plots in new range
+  ID = approx(ID$x, ID$y, xout=x)
+  RD = approx(RD$x, RD$y, xout=x)
+  AN = approx(AN$x, AN$y, xout=x)
+  GP = approx(GP$x, GP$y, xout=x)
+  S = approx(S$x, S$y, xout=x)
+  AQ = approx(AQ$x, AQ$y, xout=x)
+  NT = approx(NT$x, NT$y, xout=x)
+  DI = approx(DI$x, DI$y, xout=x)
+  
+  Normalise_density <- function(y, dx)
+  { # make the area under the curve 1
+    area = sum(y)*dx
+    return(y / area)
+  }
+  
+  # percentage ID * number of reads * assay type * genus percentage in database * proportion of species
+  posterior_match = Normalise_density(ID$y, dx) * Normalise_density(RD$y, dx) * Normalise_density(AN$y, dx) * Normalise_density(GP$y, dx) * Normalise_density(S$y, dx) 
+  posterior_match = Normalise_density(posterior_match, dx)
+  
+  # aquamaps probability * number of species in target area * closest distance
+  posterior_location = Normalise_density(AQ$y, dx) * Normalise_density(NT$y, dx) * Normalise_density(DI$y, dx)
+  posterior_location = Normalise_density(posterior_location, dx)
+  
+  combined_posterior = posterior_match * posterior_location
+  combined_posterior = Normalise_density(combined_posterior, dx)
+  
+  
+  # Now that we have the plots for the 3 posterior densities, we need to calculate the expected values and confidence intervals
+  Get_Expected_value <- function(x,y,dx)
+  {
+    # Approximate numerical approximation of expected value for distribution
+    # Other numerical methods may be better, e.g Simpsons rule, etc
+    expected_value = sum(x*y)*dx
+    return(expected_value)
+  }
+  
+  expected_c = Get_Expected_value(x, combined_posterior, dx)
+  expected_m = Get_Expected_value(x, posterior_match, dx)
+  expected_l = Get_Expected_value(x, posterior_location, dx)
+  
+  # Find the cumulative density function for credible intervals
+  cdf_c = cumsum(combined_posterior*dx)
+  cdf_m = cumsum(posterior_match*dx)
+  cdf_l = cumsum(posterior_location*dx)
+  
+  # Normalise cumulative sum
+  cdf_c = cdf_c/max(cdf_c)
+  cdf_m = cdf_m/max(cdf_m)
+  cdf_l = cdf_l/max(cdf_l)
+
+  # Find the index of the credible intervals 
+  conf_index_c = c( max(which(cdf_c < (1-confidence_int)/2)),   min(which(cdf_c > 0.5 + confidence_int/2)) )
+  conf_index_m = c( max(which(cdf_m < (1-confidence_int)/2)),   min(which(cdf_m > 0.5 + confidence_int/2)) )
+  conf_index_l = c( max(which(cdf_l < (1-confidence_int)/2)),   min(which(cdf_l > 0.5 + confidence_int/2)) )
+  
+  conf_c = c(x[conf_index_c[1]], x[conf_index_c[2]])
+  conf_m = c(x[conf_index_m[1]], x[conf_index_m[2]])
+  conf_l = c(x[conf_index_l[1]], x[conf_index_l[2]])
+  
+  # intervals cannot be less than 0 and more than 1
+  conf_c[1] = max(conf_c[1],0)
+  conf_m[1] = max(conf_m[1],0)
+  conf_l[1] = max(conf_l[1],0)
+  conf_c[2] = min(conf_c[2],1)
+  conf_m[2] = min(conf_m[2],1)
+  conf_l[2] = min(conf_l[2],1)
+  
+  
+  # Save this information into a data frame
+  df <- data.frame(c("Combined Posterior Probability", "Match Probability", "Location Probability"),c(expected_c, expected_m,expected_l), c(conf_c[1], conf_m[1], conf_l[1]), c(conf_c[2], conf_m[2], conf_l[2]),paste("Using ", c(confidence_int*100,confidence_int*100,confidence_int*100), "% credible interval"))
+  names(df) <- c("Probability Type","Expected Value", "Lower Confidence Interval","Upper Confidence Interval","Info")
   
   if (show_stats)
   {
     print(summary(codaobj))
   }
   
-  if (show_density)
+  if (show_all_densities)
   {
     plot(codaobj, trace=FALSE)
+  }
+    
+  if (show_posterior_density)
+  {
+    par(mfrow = c(2,2))
+    
+    # Total Posterior Density Plot
+    plot(x,combined_posterior,main="Total Posterior with Credible Interval",xlab="Probability",ylab="Density",type='l',lwd=2,col='red')
+    lines(c(conf_c[1],conf_c[1]), c(0,combined_posterior[conf_index_c[1]]),lty = 2)
+    lines(c(conf_c[2],conf_c[2]), c(0,combined_posterior[conf_index_c[2]]),lty = 2)
+    
+    # Match Posterior Density Plot
+    plot(x,posterior_match,main="DNA Match Posterior with Credible Interval",xlab="Probability",ylab="Density",type='l',lwd=2,col='blue')
+    lines(c(conf_m[1],conf_m[1]), c(0,posterior_match[conf_index_m[1]]),lty = 2)
+    lines(c(conf_m[2],conf_m[2]), c(0,posterior_match[conf_index_m[2]]),lty = 2)
+    
+    # Location Posterior Density Plot
+    plot(x,posterior_location,main="Location Posterior with Credible Interval",xlab="Probability",ylab="Density",type='l',lwd=2,col='green')
+    lines(c(conf_l[1],conf_l[1]), c(0,posterior_location[conf_index_l[1]]),lty = 2)
+    lines(c(conf_l[2],conf_l[2]), c(0,posterior_location[conf_index_l[2]]),lty = 2)
+    
+    # Show all posterior densities on  the same plot
+    plot(x,combined_posterior,main="All 3 Posteriors",xlab="Probability",ylab="Density",type='l',lwd=1,col='red',lty=1)
+    lines(x,posterior_match,type='l',lwd=1,col='blue',lty=2)
+    lines(x,posterior_location,type='l',lwd=1,col='green',lty=3)
+    legend("top",legend = c("Total", "Match", "Location"),col=c('red','blue','green'),lty=c(1,2,3))
   }
   
   if (show_trace)
@@ -153,9 +320,8 @@ eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigm
     plot(codaobj, density=FALSE)
     
   }
-
-
-
+  
+  return(df)
 }
 ```
 
@@ -168,37 +334,35 @@ eDNA_OpenBUGS <- function(p_species, n_species, p_reads, sigma_reads, p_ID, sigm
 ```{r}
 # Test everything:
 
-
+percent_ID = 0.9
+read_counts = 20
+p_assay = 0.9
+diverse_score = 0.2 
+percent_genus_db = 0.7
 p_species = 0.7
-n_species = 35
-p_reads = 0.8
-sigma_reads = 0.4
-p_ID = 0.95
-sigma_ID = 0.1
-p_location = 0.6
-sigma_location = 0.5
-p_assay = 0.8
-sigma_assay = 0.2
-p_genus_location = 0.7
-n_genus_location = 44
-show_trace=F
-show_density=T
+p_aquamaps = 0.8
+num_in_area = 4
+nearest_distance = 40
+distance_for_50_percent = 50
+num_iterations = 11000
+num_burnin = 1000
+show_trace=T
+show_all_densities=T
+show_posterior_density=T
 show_stats=T
-show_all_vars=T
+debug=F
 
-
-test_probs = eDNA_OpenBUGS(p_species, n_species, p_reads, sigma_reads, p_ID, sigma_ID, p_location, sigma_location,  
-                          p_assay, sigma_assay, p_genus_location, n_genus_location, show_trace=show_trace, show_density=show_density,show_stats=show_stats,show_all_vars=show_all_vars)
+test_probs = eDNA_OpenBUGS(percent_ID, read_counts, p_assay, diverse_score, percent_genus_db, p_species=p_species, p_aquamaps, num_in_area, nearest_distance, 
+                           distance_for_50_percent =   distance_for_50_percent,num_iterations=num_iterations, num_burnin = num_burnin,
+                           show_all_densities=show_all_densities,show_posterior_density=show_posterior_density,show_stats=show_stats,show_trace=show_trace,debug=debug)
 ```
 
 
+Takes roughly 5 seconds, 5s times 1,067,313 rows is 5336565s, or 62 days, way too long, needs to be about 1 day
 
 
 
-
-
-
-
-
-
+```{r}
+test_probs
+```
 
