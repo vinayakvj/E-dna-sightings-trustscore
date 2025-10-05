@@ -1,0 +1,155 @@
+---
+title: "Big CSV EDA"
+author: "Nitish Rungta"
+output: html_document
+params:
+  input: "C:/Users/nikki/Downloads/all_voyages.csv/all_voyages.csv"
+  outdir: "eda_out"
+  sample_frac: 0.01
+  top_k: 10
+---
+
+
+
+```{r}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE)
+
+
+req <- c("data.table","ggplot2")
+for (p in req) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
+library(data.table); library(ggplot2)
+
+
+input  <- normalizePath(params$input, winslash="/", mustWork=TRUE)
+outdir <- params$outdir; if (is.null(outdir) || outdir=="") outdir <- "eda_out"
+
+if (!grepl("^([A-Za-z]:|/)", outdir)) outdir <- file.path(getwd(), outdir)
+dir.create(outdir, recursive=TRUE, showWarnings=FALSE)
+cat("Writing outputs to:", outdir, "\n")
+
+
+safe_fwrite <- function(x, path) {
+  dir.create(dirname(path), recursive=TRUE, showWarnings=FALSE)
+  data.table::fwrite(x, path)
+}
+sample_frac <- max(0, min(1, params$sample_frac))
+top_k <- as.integer(params$top_k)
+
+
+
+dt <- fread(input, nThread = max(1, parallel::detectCores()-1), showProgress=TRUE)
+cat(sprintf("Rows: %s | Cols: %s\n\n", format(nrow(dt), big.mark=","), ncol(dt)))
+head10 <- head(dt, 10)
+safe_fwrite(head10, file.path(outdir, "head10.csv"))
+knitr::kable(data.frame(column=names(dt), class=sapply(dt, \(x) class(x)[1]))[1:min(20, ncol(dt)), ])
+
+
+is_blank <- function(v) is.na(v) | (is.character(v) & trimws(v) == "")
+col_names <- names(dt)
+missing_vec <- vapply(col_names, function(nm) {
+  v <- dt[[nm]]
+  sum(is_blank(v))
+}, numeric(1))
+
+missing_df <- data.frame(
+  column = col_names,
+  total  = rep(nrow(dt), length(col_names)),
+  missing = as.numeric(missing_vec),
+  stringsAsFactors = FALSE
+)
+missing_df$missing_pct <- with(missing_df, ifelse(total > 0, missing/total, NA_real_))
+missing_df <- missing_df[order(-missing_df$missing_pct), , drop=TRUE]
+safe_fwrite(missing_df, file.path(outdir, "missingness.csv"))
+knitr::kable(utils::head(missing_df, 20))
+
+
+num_cols <- names(dt)[sapply(dt, is.numeric)]
+cat_cols <- setdiff(names(dt), num_cols)
+cat("Numeric:", length(num_cols), "| Categorical:", length(cat_cols), "\n")
+
+
+if (length(num_cols)) {
+  num_summary <- data.table(
+    column    = num_cols,
+    n_nonnull = sapply(dt[, ..num_cols], \(x) sum(!is.na(x))),
+    min       = sapply(dt[, ..num_cols], \(x) suppressWarnings(min(x, na.rm=TRUE))),
+    mean      = sapply(dt[, ..num_cols], \(x) suppressWarnings(mean(x, na.rm=TRUE))),
+    sd        = sapply(dt[, ..num_cols], \(x) suppressWarnings(sd(x, na.rm=TRUE))),
+    q05       = sapply(dt[, ..num_cols], \(x) suppressWarnings(quantile(x, 0.05, na.rm=TRUE, names=FALSE))),
+    median    = sapply(dt[, ..num_cols], \(x) suppressWarnings(quantile(x, 0.50, na.rm=TRUE, names=FALSE))),
+    q95       = sapply(dt[, ..num_cols], \(x) suppressWarnings(quantile(x, 0.95, na.rm=TRUE, names=FALSE))),
+    max       = sapply(dt[, ..num_cols], \(x) suppressWarnings(max(x, na.rm=TRUE)))
+  )
+} else {
+  num_summary <- data.table()
+}
+if (nrow(num_summary)) {
+  safe_fwrite(num_summary, file.path(outdir, "numeric_summary.csv"))
+  knitr::kable(utils::head(num_summary, 20))
+} else cat("No numeric columns detected.\n")
+
+
+
+if (length(cat_cols)) {
+  
+  cat_summary <- data.table(
+    column = cat_cols,
+    approx_unique = sapply(dt[, ..cat_cols], data.table::uniqueN, na.rm = TRUE)
+  )[order(-approx_unique)]
+  safe_fwrite(cat_summary, file.path(outdir, "categorical_summary.csv"))
+  knitr::kable(utils::head(cat_summary, 20))
+
+ 
+  show_cols <- utils::head(cat_cols, 5)
+  for (cname in show_cols) {
+    # use get(cname) to reference the column by name
+    topk <- dt[, .N, by = list(level = get(cname))][order(-N)]
+    topk <- topk[1:min(top_k, nrow(topk))]
+    data.table::setnames(topk, old = c("level","N"), new = c("level","n"))
+    cat("\n**Top levels for** ", cname, "\n", sep = "")
+    print(knitr::kable(topk))
+  }
+} else {
+  cat("No categorical columns detected.\n")
+}
+
+
+
+if (length(num_cols)) {
+  n_samp <- max(1000, ceiling(nrow(dt) * sample_frac))
+  set.seed(1); samp <- dt[sample(.N, min(.N, n_samp))]
+  for (cname in head(num_cols, 3)) {
+    p <- ggplot(samp, aes(x = .data[[cname]])) +
+      geom_histogram(bins = 50) +
+      labs(title = paste("Sampled distribution:", cname), x = cname, y = "count")
+    print(p)
+  }
+}
+
+
+
+find_col <- function(pat) {
+  m <- names(dt)[grepl(pat, names(dt), ignore.case=TRUE)]
+  if (length(m)) m[1] else NA_character_
+}
+col_id   <- find_col("^%?ID$|percent_id|pct_id")
+col_cov  <- find_col("cover(age)?|overlap")
+col_reads<- find_col("^reads?$|read_count|n_reads")
+col_lat  <- find_col("^lat")
+col_lon  <- find_col("^lon|long")
+
+if (!any(is.na(c(col_lat, col_lon)))) {
+  ok <- !is.na(dt[[col_lat]]) & !is.na(dt[[col_lon]])
+  bbox <- data.table(
+    min_lat = min(dt[[col_lat]][ok], na.rm=TRUE),
+    max_lat = max(dt[[col_lat]][ok], na.rm=TRUE),
+    min_lon = min(dt[[col_lon]][ok], na.rm=TRUE),
+    max_lon = max(dt[[col_lon]][ok], na.rm=TRUE)
+  )
+  safe_fwrite(bbox, file.path(outdir, "geo_bbox.csv"))
+  knitr::kable(bbox)
+} else {
+  cat("Latitude/Longitude columns not detected.\n")
+}
+
+```
