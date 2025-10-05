@@ -1,0 +1,151 @@
+---
+title: "prob"
+author: "captone"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+in_csv  <- "C:/Users/nikki/Downloads/all_voyages.csv/all_voyages.csv"      
+out_csv <- "C:/Users/nikki/Desktop/curated_scored.csv"
+
+
+if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
+library(data.table)
+
+
+nznum <- function(x) suppressWarnings(as.numeric(x))
+logistic <- function(z) 1/(1+exp(-z))
+
+
+lik_id <- function(x_id, mid=98, scale=0.5) {
+  x <- nznum(x_id); ifelse(is.na(x), NA_real_, logistic((x - mid)/scale))
+}
+
+assay_mult <- function(assay) {
+  a <- tolower(trimws(as.character(assay)))
+  out <- rep(1.00, length(a))
+  out[grepl("12s", a)] <- 0.95
+  out[grepl("coi", a)] <- 1.05
+  out
+}
+
+lik_reads <- function(count, mid_log=2, scale=0.5) {  
+  lr <- log10(pmax(nznum(count),0)+1)
+  logistic((lr - mid_log)/scale)
+}
+
+prior_geo <- function(lat, lon) {
+  la <- nznum(lat); lo <- nznum(lon)
+  inside <- !is.na(la) & !is.na(lo) & la >= -44 & la <= -10 & lo >= 112 & lo <= 154
+  p <- ifelse(inside, 0.75, 0.25)     
+  p[is.na(la) | is.na(lo)] <- 0.50    
+  p
+}
+
+
+prior_lca <- function(lca) {
+  r <- tolower(trimws(as.character(lca)))
+  v <- rep(0.5, length(r))
+  v[grepl("^species$", r)] <- 0.75
+  v[grepl("^genus$",   r)] <- 0.60
+  v[grepl("^family$",  r)] <- 0.50
+  v[grepl("^order$",   r)] <- 0.40
+  v[is.na(r) | r==""]  <- 0.50
+  v
+}
+
+combine_nb <- function(prior, ...) {
+  terms <- list(...)
+  p0 <- pmin(pmax(prior, 1e-6), 1-1e-6)
+  odds <- p0/(1-p0)
+  for (t in terms) {
+    x <- pmin(pmax(t, 1e-6), 1-1e-6)
+    x[is.na(t)] <- 1-1e-6  
+    odds <- odds * (x/(1-x))
+  }
+  odds/(1+odds)
+}
+
+
+dt <- fread(in_csv)
+
+
+col_id   <- "X.ID"                 
+col_reads<- "count"
+col_lat  <- "decimalLatitude"
+col_lon  <- "decimalLongitude"
+col_lca  <- "LCA"
+col_assay<- "assay_name"          
+col_sp   <- "species"
+
+
+id_like   <- if (col_id %in% names(dt)) lik_id(dt[[col_id]]) else NA_real_
+ass_mult  <- if (col_assay %in% names(dt)) assay_mult(dt[[col_assay]]) else 1.0
+reads_like<- if (col_reads %in% names(dt)) lik_reads(dt[[col_reads]]) else NA_real_
+geo_pr    <- if (all(c(col_lat,col_lon) %in% names(dt))) prior_geo(dt[[col_lat]], dt[[col_lon]]) else rep(0.5, nrow(dt))
+lca_pr    <- if (col_lca %in% names(dt)) prior_lca(dt[[col_lca]]) else rep(0.5, nrow(dt))
+
+
+p_prior   <- combine_nb(0.5, geo_pr, lca_pr, reads_like)
+
+
+id_like_adj <- pmin(pmax(id_like * ass_mult, 1e-6), 1-1e-6)
+
+
+p_post <- combine_nb(p_prior, id_like_adj)
+
+th_valid <- 0.80; th_plaus  <- 0.50; th_rev <- 0.30
+label <- ifelse(p_post >= th_valid, "1 Validated",
+         ifelse(p_post >= th_plaus,  "2 Plausible",
+         ifelse(p_post >= th_rev,     "Review", "4 Remove")))
+
+
+out <- data.table(
+  species = if ("species" %in% names(dt)) dt$species else NA_character_,
+  id_like = round(id_like,3),
+  assay_mult = round(ass_mult,2),
+  reads_like = round(reads_like,3),
+  geo_prior = round(geo_pr,3),
+  lca_prior = round(lca_pr,3),
+  p_prior = round(p_prior,3),
+  p_reliability = round(p_post,3),
+  label = label
+)
+dir.create(dirname(out_csv), recursive = TRUE, showWarnings = FALSE)
+data.table::fwrite(out, out_csv)
+
+fwrite(out, out_csv)
+cat("Wrote:", out_csv, "rows:", nrow(out), "\n")
+
+## 
+```
+
+#How it combines things (Bayes, odds form)
+
+Start with a prior (combining loc_score + lca_prior + sometimes reads_score as quality).
+
+Update that prior with likelihoods (id_score, and optionally reads_score again if you treat it as evidence) using odds ratios.
+
+Result = p_reliability in [0,1]: the probability the sighting is real given all signals.
+
+Intuition: location say “how plausible this species is here,” DNA & reads say “how strong the evidence is.” Together -> posterior probability.
+
+How labels are set
+
+Based on p_reliability thresholds (you can change these):
+
+≥ 0.80 → “1 Validated” (strong evidence, consistent context)
+
+0.50–0.79 → “2 Plausible” (likely, but one signal weaker/missing)
+
+0.30–0.49 → “Review” (conflict/ambiguity needs check)
+
+< 0.30 → “4 Remove” (not credibl)
+
+The numbers (1–4) are just an ordering code so sorting/filters work sensibly.

@@ -1,0 +1,108 @@
+---
+title: "Untitled"
+author: "Nitish Rungta (23939001)"
+date: "2025-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+req <- c("data.table","sf","httr2","jsonlite")
+for (p in req) if (!requireNamespace(p, quietly=TRUE)) install.packages(p)
+library(data.table); library(sf); library(httr2); library(jsonlite)
+
+# parameter
+RADIUS_KM <- 200      
+TH_YES     <- 0.60      
+GRID_DEG   <- 0.5       
+
+
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+nznum  <- function(x) suppressWarnings(as.numeric(x))
+map_count_to_score <- function(n) { 
+  pmin(1, log10(pmax(n,0)+1)/4)
+}
+
+circle_wkt <- function(lon, lat, radius_km = 200) {
+  pt  <- st_sfc(st_point(c(lon, lat)), crs = 4326)
+  buf <- st_transform(pt, 3857) |> st_buffer(radius_km * 1000) |> st_transform(4326)
+  st_as_text(buf)
+}
+
+
+OBIS_CACHE <- "cache/obis_counts.csv"
+if (!dir.exists("cache")) dir.create("cache", recursive = TRUE)
+if (file.exists(OBIS_CACHE)) obis_cache <- fread(OBIS_CACHE) else obis_cache <- data.table(
+  species = character(), cell = character(), radius_km = integer(), total = integer()
+)
+
+get_obis_count_near <- function(species, lon, lat, radius_km = RADIUS_KM) {
+  if (is.na(species) || is.na(lon) || is.na(lat)) return(NA_integer_)
+
+  cell <- paste(round(lat/GRID_DEG)*GRID_DEG, round(lon/GRID_DEG)*GRID_DEG, sep = "_")
+  hit  <- obis_cache[species == species & cell == cell & radius_km == radius_km]
+  if (nrow(hit)) return(hit$total[1])
+
+  wkt <- circle_wkt(lon, lat, radius_km)
+  req <- request("https://api.obis.org/v3/occurrence") |>
+    req_url_query(limit = 0, scientificname = species, geometry = wkt)
+
+  res <- tryCatch(req_perform(req) |> resp_body_json(), error = function(e) NULL)
+  n   <- res$total %||% res$size %||% NA_integer_
+
+  obis_cache <<- unique(rbind(obis_cache, data.table(species, cell, radius_km, total = n), fill = TRUE))
+  fwrite(obis_cache, OBIS_CACHE)
+  n
+}
+
+add_obis_location <- function(dt, col_sp = "species", col_lat = "decimalLatitude", col_lon = "decimalLongitude") {
+  stopifnot(col_sp %in% names(dt), col_lat %in% names(dt), col_lon %in% names(dt))
+  s <- as.character(dt[[col_sp]])
+  la <- nznum(dt[[col_lat]])
+  lo <- nznum(dt[[col_lon]])
+
+
+  counts <- mapply(get_obis_count_near, s, lo, la, MoreArgs = list(radius_km = RADIUS_KM))
+
+  
+  score <- map_count_to_score(counts)
+
+  
+  yn <- ifelse(is.na(score), NA_character_,
+        ifelse(score >= TH_YES, "Y", "N"))
+
+  dt[, `:=`(loc_obis_count = counts,
+            loc_obis   = score,
+            loc_obis_yes   = yn)]
+  dt
+}
+
+
+
+```
+
+```{r}
+dt <- fread("C:/Users/nikki/Downloads/all_voyages.csv/all_voyages.csv")
+dt <- add_obis_location(dt, col_sp = "species", col_lat = "decimalLatitude", col_lon = "decimalLongitude")
+fwrite(dt[, .(species, decimalLatitude, decimalLongitude, loc_obis_count, loc_obis, loc_obis_yes)],
+       "C:/Users/nikki/Desktop/loc_obis_only.csv")
+
+```
+
+```{r}
+
+
+```
+
+
+
+
+
+```{r}
+
+
+
+```
