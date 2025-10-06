@@ -1,0 +1,1068 @@
+---
+title: "GBIF Data Extraction"
+author: "Nathan Reed (24110024)"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+This markdown file uses the GBIF API to extract a variety of information and uses it to enrich our original dataset. The main components / processes are:
+
+1. Data processing / preparation
+
+  * Cleanup and structure the data
+  * Generate a unique species list and matching taxonKey to enable efficient calls to the GBIF API
+
+2. Location calculations
+
+  * Create an "Area of Interest" (AOI) mapped to the locations of all eDNA samples
+  * Download species observation data from GBIF from within the AOI
+  * Measure the distance between an eDNA sample and the nearest recorded observation of that species
+
+3. Species DNA availability
+
+  * Download data relating to the availability of DNA matches for each species and assay types
+  * Calculate a  per genus DNA catalogue value representing how well that genus is covered in online DNA databases
+  
+  
+## Important notes and considerations
+
+ * This markdown file has been provided to enable thorough examination of our approach and processes, with a focus on GBIF. For day to day client use a singular .R script file will also be provided that does not contain the same level of commentary, exploration and visualisations.
+ 
+ * Some components of this script require downloads that can take many hours. Where possible local caches of files are retained and scripts only download incremental updates, however care should be take to read instructions and skip code blocks that will result in unnecessary duplication of downloads.
+ 
+ * Some libraries may require additional OS installs. i.e. Ubuntu 24.04 LTS requires:
+
+    * libudunits2 as a dependency of the SF library from Cran (sudo apt install libudunits2-dev) 
+    * GDAL, GEOS, PROJ, netcdf, sqlite3 and tbb as dependencies of the RSpatial library from CRAN (sudo apt-get install libgdal-dev gdal-bin libgeos-dev libproj-dev libtbb-dev libnetcdf-dev)
+
+
+# Load data and libraries
+
+The problems in the data import all relate to column 22 ("neg_cont_type") which isn't used in our analysis but always good to check on import whether there were any issues.
+
+```{r}
+library(dplyr)
+library(geosphere)
+library(ggplot2)
+library(httr)
+library(jsonlite)
+library(lwgeom)
+library(progress)
+library(progressr)
+library(purrr)
+library(readr)
+library(rgbif)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(sf)
+library(stringr)
+library(tibble)
+library(tidyr)
+
+# Load in the full dataset
+data <- read_csv("../Data/all_voyages.csv")
+problems(data)
+```
+
+## Cleanup and structure the data
+Next subset the data to only the columns we need and limit observations to ray-finned and cartilaginous fish as the client does not require information about other classes of animals such as birds and mammals.
+
+```{r}
+keep_columns <- c("ASV","sample","assay_name","Assay","count",
+                  "class","order","family","genus","species","Species_In_LCA","X.ID",
+                  "ASV_sequence","decimalLongitude","decimalLatitude")
+data <- data[,keep_columns]
+str(data)
+
+# Filter dataframe to only include finned and cartilage fishes
+data <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
+```
+
+## Assay variables
+
+There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use as it does not contain any NA values.
+
+```{r}
+table(data$Assay, useNA="always")
+table(data$assay_name, useNA="always")
+
+# Drop "assay_name" from the data
+data <- select(data, -assay_name)
+
+# Create a new variable which is the string length of the ASV sequence
+data$Assay_Length <- nchar(data$ASV_sequence)
+
+# Re-order columns so related data is next to each other
+data <- data %>% relocate(Assay, .after = 3)
+data <- data %>% relocate(Assay_Length, .after = 4)
+
+str(data)
+```
+
+# Generate Species list and taxonKey for easier GBIF API access
+
+## Function for processing data to extract unique species list
+
+```{r}
+# Function to deal with any empty fields returned by the API
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Generate a list of unique species from the "Species_In_LCA" column
+extract_unique_species <- function(df, col = "Species_In_LCA") {
+  if (!col %in% names(df)) stop(sprintf('Column "%s" not found.', col))
+  df[[col]] |>
+    str_split(",") |>
+    unlist(use.names = FALSE) |>
+    str_squish() |>
+    discard(~ .x == "" || is.na(.x)) |>
+    unique() |>
+    sort()
+}
+
+# Obtain the species taxonKey from GBIF
+resolve_one <- function(name) {
+  res <- tryCatch(
+    name_backbone(name = name, rank = "species"),
+    error = function(e) list()
+  )
+  tibble(
+    species_input = name,
+    taxonKey      = res[["usageKey"]]       %||% NA_integer_,
+    matchedName   = res[["scientificName"]] %||% NA_character_,
+    matchType     = res[["matchType"]]      %||% NA_character_,
+    matchRank     = res[["rank"]]           %||% NA_character_
+  )
+}
+
+# Process all species and export to GBIF_Taxonomy.csv
+resolve_species_backbone <- function(species_vec,
+                                     out_csv = "../Data/GBIF_Taxonomy.csv",
+                                     overwrite = FALSE,
+                                     polite_pause = 0) {
+  species_vec <- unique(str_squish(as.character(species_vec)))
+  species_vec <- species_vec[species_vec != "" & !is.na(species_vec)]
+
+  # Read existing lean file (if any) and normalize old schemas on the fly
+  existing <- if (file.exists(out_csv) && !overwrite) read_csv(out_csv, show_col_types = FALSE) else NULL
+  if (!is.null(existing)) {
+    # keep only the lean columns if an older, wider file is present
+    wanted <- c("species_input","taxonKey","matchedName","matchType","matchRank")
+    missing <- setdiff(wanted, names(existing))
+    if (length(missing)) {
+      # try to fill matchRank from 'rank' if present (older schema)
+      if ("rank" %in% names(existing) && "matchRank" %in% missing) existing <- rename(existing, matchRank = rank)
+      # drop extras, keep available lean cols
+      existing <- existing %>% select(any_of(wanted))
+    }
+  }
+
+  to_resolve <- setdiff(species_vec, existing$species_input %||% character())
+
+  if (length(to_resolve) == 0 && !is.null(existing)) {
+    message("No new species to resolve. Using existing reference: ", out_csv)
+    final <- existing %>%
+      filter(species_input %in% species_vec) %>%
+      distinct(species_input, .keep_all = TRUE) %>%
+      arrange(species_input)
+    write_csv(final, out_csv)
+    return(final)
+  }
+
+  pb <- progress::progress_bar$new(
+    total = length(to_resolve),
+    format = "Resolving [:bar] :current/:total (:percent) ETA: :eta",
+    clear = FALSE, width = 70
+  )
+
+  new_rows <- map_dfr(to_resolve, function(nm) {
+    out <- resolve_one(nm)
+    pb$tick()
+    if (polite_pause > 0) Sys.sleep(polite_pause)
+    out
+  })
+
+# Important to filter only those where there is a species or genus match else it causes data download explosion later if it steps up to family level
+  final <- bind_rows(existing %||% tibble(), new_rows) %>%
+    filter(species_input %in% species_vec) %>%
+    distinct(species_input, .keep_all = TRUE) %>%
+    arrange(species_input) %>%
+    filter(matchRank %in% c("SPECIES", "GENUS")) 
+
+  write_csv(final, out_csv)
+  message("Wrote taxonomy reference: ", normalizePath(out_csv))
+  final
+}
+
+```
+
+## Run the script and then join to main dataframe
+
+Note that this update is incremental. If GBIF_Taxonomy.csv already exists in the "../Data/" directory then it will only add new species that are listed in the local "data" dataframe but not currently in "../Data/GBIF_Taxonomy.csv".
+
+If GBIF_Taxonomy.csv does not exist then it will be generated and this process takes between 20 and 30 minutes depending on the number of unique species in the "data" dataframe.
+
+```{r}
+
+# Run the script
+species_vec <- extract_unique_species(data, "Species_In_LCA")
+taxonomy <- resolve_species_backbone(
+  species_vec,
+  out_csv = "../Data/GBIF_Taxonomy.csv",
+  overwrite = FALSE,
+  polite_pause = 0
+)
+
+# Join data$species to taxonomy$species_input
+data <- data %>%
+  left_join(
+    taxonomy %>% select(species_input, taxonKey, matchType),
+    by = c("species" = "species_input")
+  )
+
+# QA summaries for data matching
+unmatched <- data %>% filter(is.na(taxonKey))
+fuzzy     <- data %>% filter(!is.na(taxonKey), matchType != "EXACT")
+
+cat("Total rows: ", nrow(data), "\n")
+cat("Rows with a taxonKey: ", nrow(data) - nrow(unmatched), "\n")
+cat("Rows without a taxonKey: ", nrow(unmatched), "\n")
+cat("Rows with non-EXACT matches: ", nrow(fuzzy), "\n")
+
+```
+
+# Map sample locations for all species
+
+Polling the GBIF API for location based observations by species row by row quickly hits the API rate limit.
+Instead we create a bounding box for all the locations in the datafile and then bulk download the GBIF data for species observations within that bounding box.
+Note that this requires a download through a validated account. Login credentials are stored in the "gbif.creds" file in the code folder.
+
+```{r}
+gbif_creds <- read.csv("gbif.creds", header=FALSE)
+gbif_u <- gbif_creds[1,2]
+gbif_p <- gbif_creds[3,2]
+gbif_e <- gbif_creds[2,2]
+
+Sys.setenv(GBIF_USER=gbif_u, GBIF_PWD=gbif_p, GBIF_EMAIL=gbif_e)
+```
+
+
+```{r}
+# Keep only rows with coordinates and a taxonKey
+work <- data %>%
+  filter(!is.na(taxonKey), !is.na(decimalLatitude), !is.na(decimalLongitude))
+
+# Extract the list of taxonKeys from which to download location information
+taxa <- work$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 25
+pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+aoi_wkt   <- st_as_text(aoi_wgs84)  # small WKT polygon covering all sites+buffer
+
+```
+
+### Visualise the Area of Interest
+
+Visualising all the sampling points makes it obvious that we have an outlier / data error with one of the samples. We should remove this so that we have a more coherent area of interest.
+
+```{r}
+# Load basemap of Australia
+aus <- rnaturalearth::ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+### Remove invalid lat/lon
+
+```{r}
+# Compute centroid of all sampling points (ignoring NA)
+lat_mean <- mean(data$decimalLatitude, na.rm = TRUE)
+lon_mean <- mean(data$decimalLongitude, na.rm = TRUE)
+
+# Approximate great-circle distance from centroid (km)
+library(geosphere)
+data_with_dist <- data %>%
+  mutate(
+    distance_from_center_km = distHaversine(
+      cbind(decimalLongitude, decimalLatitude),
+      c(lon_mean, lat_mean)
+    ) / 1000
+  ) %>%
+  arrange(desc(distance_from_center_km))
+
+# Show the top 10 farthest points
+data_with_dist %>% select(species, decimalLatitude, decimalLongitude, distance_from_center_km) %>% head(10)
+
+```
+
+The erroneous location has Lat/Lon in the middle of the Pacific Ocean, but the field "geo_loc_name" is Indian Ocean: Diamantina. A lat/lon of -32.1088, 110.266 would put these samples closer to the Diamantina but not exactly on it. We have decided to drop these rows from our analysis but the potential is there to change them to decimalLongitude 110.2667
+
+```{r}
+hist(data$decimalLongitude)
+
+# Filter rows where longitude > 200
+suss_longitudes <- data %>% filter(decimalLongitude > 200)
+print(suss_longitudes)
+
+# Filter the original dataset to understand more about these locations
+data_lon200 <- read_csv("../Data/all_voyages.csv")
+data_lon200 <- data_lon200 %>% filter(decimalLongitude > 200)
+write_csv(data_lon200, "../Data/all_voyages_lon200.csv")
+
+# Filter data to remove invalid Longitudes
+data <- data %>% filter(decimalLongitude < 200)
+```
+
+### Refit our AOI with rows containing invalid location data removed
+
+```{r}
+# Keep only rows with coordinates and a taxonKey
+work <- work %>% filter(decimalLongitude < 180)
+
+# Extract the list of taxonKeys from which to download location information
+taxa <- work$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 50
+pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+
+# Validate geometry as GBIF requires counter clockwise polygons
+aoi_wgs84 <- st_make_valid(aoi_wgs84)
+
+signed_area <- suppressWarnings(as.numeric(st_area(aoi_wgs84)))
+if (any(signed_area < 0)) {
+  message("AOI polygon is clockwise — reversing orientation to CCW.")
+  aoi_wgs84 <- st_reverse(aoi_wgs84)
+}
+
+aoi_wgs84 <- st_zm(aoi_wgs84)
+
+# If the polygon isn't working use a simple bounding box
+if (!st_is_valid(aoi_wgs84)) {
+  message("AOI polygon still invalid after reversing — using bounding box instead.")
+  bb <- st_bbox(aoi_wgs84)
+  aoi_wkt <- sprintf(
+    "POLYGON((%f %f,%f %f,%f %f,%f %f,%f %f))",
+    bb$xmin, bb$ymin,
+    bb$xmax, bb$ymin,
+    bb$xmax, bb$ymax,
+    bb$xmin, bb$ymax,
+    bb$xmin, bb$ymin
+  )
+} else {
+  aoi_wkt <- st_as_text(aoi_wgs84)
+}
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+## Understand and scope the available GBIF location observation data
+
+Early iterations of our code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). The code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
+
+These raw counts of species observations also provide us with a proxy measure of species abundance with common / high population species expected to have high observation counts compared with rare / low population species.
+
+**NOTE:** It takes about 20 minutes to process the below block. **DO NOT RUN** unless you need to regenerate the counts of species observations from GBIF. I've added a flag to this code block "taxon_count_rebuild" and set to FALSE. This will stop the download happening unless you change this flag to TRUE.
+
+### Obtain counts of observations for each species within the AOI
+
+```{r}
+# Build a vector of taxonKeys
+taxa <- taxonomy$taxonKey %>% unique() %>% na.omit() %>% as.character()
+
+taxon_count_rebuild = FALSE
+
+# Function: count occurrences of each species in the AOI
+count_one <- function(key, wkt = NULL) {
+  tryCatch({
+    res <- occ_search(taxonKey = key, country = "AU",
+                      hasCoordinate = TRUE,
+                      geometry = wkt,
+                      limit = 0)
+    res$meta$count %||% NA_integer_
+  }, error = function(e) NA_integer_)
+}
+
+pb <- progress_bar$new(
+  total = length(taxa),
+  format = "Counting [:bar] :current/:total (:percent) ETA: :eta",
+  clear = FALSE, width = 70
+)
+
+# Query all taxonKeys
+
+if (taxon_count_rebuild==TRUE) {
+  counts <- vector("integer", length(taxa))
+  for (i in seq_along(taxa)) {
+    counts[i] <- count_one(taxa[i], wkt = aoi_wkt)
+    pb$tick()
+  }
+  
+  # Build summary table if it hasn't been down before or if there is fresh downloaded data
+  abundance_tbl <- tibble(taxonKey = as.numeric(taxa), gbif_count_AOI = counts) %>%
+    left_join(taxonomy %>% select(taxonKey, matchedName), by = "taxonKey") %>%
+    arrange(desc(gbif_count_AOI))
+  
+  abundance_tbl <- unique(abundance_tbl)
+  
+  # Write counts out to file so they can be restored easily instead of running this code block every time
+  write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
+}
+
+# Re-import counts if they already exist
+abundance_tbl <- read_csv("../Data/taxonKey_Observation_Counts.csv")
+
+```
+
+
+```{r}
+# Basic stats
+summary(abundance_tbl)
+
+# Plot histogram of species observation counts
+ggplot(abundance_tbl, aes(x = gbif_count_AOI)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of GBIF Records per Species in AOI",
+    x = "Number of GBIF records",
+    y = "Number of species"
+  ) +
+  theme_minimal()
+
+
+# Classify species into abundance bins
+abundance_tbl <- abundance_tbl %>%
+  mutate(
+    abundance_class = case_when(
+      is.na(gbif_count_AOI)        ~ NA,
+      gbif_count_AOI == 0          ~ "none",
+      gbif_count_AOI >= 1000       ~ "very_common",
+      gbif_count_AOI >= 200        ~ "common",
+      gbif_count_AOI >= 50         ~ "uncommon",
+      TRUE                         ~ "rare"
+    )
+  )
+
+abundance_tbl %>% count(abundance_class)
+write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
+```
+
+### Merge with GBIF_Taxonomy to create a single source of truth
+
+```{r}
+# Re-import CSVs to make sure we have the right data
+GBIF_Taxonomy <- read_csv("../Data/GBIF_Taxonomy.csv")
+taxonKey_Observation_Counts <- read_csv("../Data/taxonKey_Observation_Counts.csv")
+
+# Make sure the join key has the same type in both data frames
+GBIF_Taxonomy <- GBIF_Taxonomy %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey)))
+
+taxonKey_Observation_Counts <- taxonKey_Observation_Counts %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey)))
+
+# Left join counts to GBIF_Taxonomy
+gbif_joined <- GBIF_Taxonomy %>%
+  left_join(
+    taxonKey_Observation_Counts,
+    by = "taxonKey",
+    suffix = c(".tax", ".obs")
+  ) %>% 
+  select(-matchedName.obs) %>%
+  rename("matchedName" = "matchedName.tax")
+
+# Diagnostics to verify the join was successful
+only_in_tax <- anti_join(GBIF_Taxonomy, taxonKey_Observation_Counts, by = "taxonKey")
+only_in_counts <- anti_join(taxonKey_Observation_Counts, GBIF_Taxonomy, by = "taxonKey")
+
+message("Rows only in GBIF_Taxonomy: ", nrow(only_in_tax))
+message("Rows only in taxonKey_Observation_Counts: ", nrow(only_in_counts))
+
+# Export to CSV
+write_csv(gbif_joined, "../Data/GBIF_Taxonomy.csv")
+
+```
+
+## Download species observation data
+
+### Function to extract observation data from AOI by species
+
+```{r}
+# Extract Taxon keys from GBIF_Taxonomy
+taxon_keys <- GBIF_Taxonomy %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey))) %>%
+  filter(!is.na(taxonKey)) %>%
+  pull(taxonKey) %>%
+  unique() %>%
+  sort()
+
+# Setup local cache folder + ability to resume an interrupted download
+obs_dir <- "../Data/SpeciesObservations"
+dir.create(obs_dir, showWarnings = FALSE, recursive = TRUE)
+
+files <- list.files(obs_dir, pattern = "^[0-9]+\\.csv$", full.names = FALSE)
+already_done <- suppressWarnings(as.integer(sub("\\.csv$", "", files)))
+already_done <- already_done[!is.na(already_done)]
+todo <- setdiff(taxon_keys, already_done)
+
+message("Total species: ", length(taxon_keys))
+message("Already cached: ", length(already_done))
+message("Remaining to fetch: ", length(todo))
+
+# Tunables / limits per GBIF API notes
+PAGE_SIZE      <- 300L      # GBIF max per page
+HARD_LIMIT     <- 100000L   # offset + limit must not exceed this
+RATE_DELAY_SEC <- 0.5       # gentle pacing between calls
+MAX_ATTEMPTS   <- 6         # retry attempts on transient errors / 429
+BASE_WAIT_SEC  <- 1         # backoff base (1,2,4,8,...)
+USE_COUNTRY <- FALSE        # set TRUE to force country = "AU"
+
+# Wrapper for search function
+safe_occ_search <- function(..., max_attempts = MAX_ATTEMPTS, base_wait = BASE_WAIT_SEC) {
+  attempt <- 1L
+  repeat {
+    res <- tryCatch(rgbif::occ_search(...), error = identity)
+    if (!inherits(res, "error")) return(res)
+    msg <- conditionMessage(res)
+    if (attempt >= max_attempts) {
+      message("  giving up after ", attempt, " attempts (", msg, ")")
+      return(NULL)
+    }
+    wait <- min(base_wait * 2^(attempt - 1L), 60)
+    if (grepl("Too many requests|429|rate limit", msg, ignore.case = TRUE)) {
+      message("  rate-limited; sleeping ", wait, "s (attempt ", attempt, ")")
+    } else {
+      message("  error: ", msg, " — retrying in ", wait, "s (attempt ", attempt, ")")
+    }
+    Sys.sleep(wait)
+    attempt <- attempt + 1L
+  }
+}
+
+# Fetch all lat/lon for one taxonKey within AOI (respects 100k cap)
+fetch_one_key_throttled <- function(key, wkt, use_country = USE_COUNTRY) {
+  # Preflight: count only
+  meta0 <- safe_occ_search(
+    taxonKey      = key,
+    hasCoordinate = TRUE,
+    geometry      = wkt,
+    country       = if (isTRUE(use_country)) "AU" else NULL,
+    limit         = 0
+  )
+  total <- tryCatch(meta0$meta$count, error = function(e) NA_integer_)
+  if (!is.na(total) && total > HARD_LIMIT) {
+    message("  key=", key, " has ", total, " records; truncating at ", HARD_LIMIT,
+            " (use occ_download() if you need all rows).")
+  }
+  page_target <- if (is.na(total)) HARD_LIMIT else min(total, HARD_LIMIT)
+
+  start <- 0L
+  out <- list()
+
+  while (start < page_target) {
+    current_limit <- min(PAGE_SIZE, HARD_LIMIT - start, page_target - start)
+    if (current_limit <= 0L) break
+
+    # Ask GBIF for only what we need: lat/lon + simple name fields + record key
+    # Ask GBIF for only what we need
+    x <- safe_occ_search(
+      taxonKey      = key,
+      hasCoordinate = TRUE,
+      geometry      = wkt,
+      country       = if (isTRUE(use_country)) "AU" else NULL,
+      start         = start,
+      limit         = current_limit,
+      fields        = c("decimalLatitude", "decimalLongitude", "species", "scientificName", "canonicalName", "taxonKey")
+    )
+    if (is.null(x) || is.null(x$data) || nrow(x$data) == 0) break
+    
+    df_page <- x$data
+    
+    # Ensure referenced columns exist (create as NA if GBIF omitted them)
+    needed <- c("species", "scientificName", "canonicalName", "taxonKey", "decimalLatitude", "decimalLongitude")
+    for (nm in needed) {
+      if (!nm %in% names(df_page)) df_page[[nm]] <- NA
+    }
+    
+    out[[length(out) + 1L]] <- df_page %>%
+      transmute(
+        requested_taxonKey = as.integer(key),
+        record_taxonKey    = suppressWarnings(as.integer(taxonKey)),
+        species_name       = dplyr::coalesce(species, scientificName, canonicalName),
+        decimalLatitude    = suppressWarnings(as.numeric(decimalLatitude)),
+        decimalLongitude   = suppressWarnings(as.numeric(decimalLongitude))
+      ) %>%
+      filter(!is.na(decimalLatitude), !is.na(decimalLongitude))
+    
+    got <- nrow(x$data)
+    start <- start + got
+    Sys.sleep(RATE_DELAY_SEC)
+    if (got < current_limit) break
+
+  }
+
+  if (length(out) == 0) {
+    tibble(
+      requested_taxonKey = as.integer(key),
+      record_taxonKey    = integer(),
+      species_name       = character(),
+      decimalLatitude    = double(),
+      decimalLongitude   = double()
+    )
+  } else {
+    bind_rows(out)
+  }
+}
+
+
+# Progress bar + loop (calls fetch_one_key_throttled, not download_one_key)
+pb <- progress_bar$new(
+  total = length(todo),
+  format = "occ_search [:bar] :current/:total (:percent) eta: :eta"
+)
+
+for (key in todo) {
+  out_path <- file.path(obs_dir, paste0(key, ".csv"))
+  df <- fetch_one_key_throttled(key, aoi_wkt)
+  write_csv(df, out_path)   # write even if empty -> resume-friendly
+  pb$tick()
+  Sys.sleep(RATE_DELAY_SEC)        # small pause between species
+}
+
+message("Done. Cached files in: ", obs_dir)
+
+# Create an index summary
+files <- list.files(obs_dir, pattern = "^[0-9]+\\.csv$", full.names = TRUE)
+if (length(files) > 0) {
+  obs_summary <- tibble(file = files) %>%
+    mutate(
+      taxonKey = as.integer(sub("\\.csv$", "", basename(file))),
+      n_rows   = vapply(
+        file,
+        function(p) nrow(suppressWarnings(readr::read_csv(p, show_col_types = FALSE))),
+        integer(1)
+      )
+    ) %>%
+    arrange(desc(n_rows))
+  readr::write_csv(obs_summary, file.path(obs_dir, "_index.csv"))
+}
+
+
+```
+
+## Compare sample Lat/Lon to GBIF species observations
+
+```{r}
+# ---- Settings ---------------------------------------------------------------
+obs_dir <- "../Data/SpeciesObservations"   # where taxonKey CSVs live
+sample_lat_col <- "decimalLatitude"        # Name of latitude column
+sample_lon_col <- "decimalLongitude"       # Name of longitude column
+.obs_cache <- new.env(parent = emptyenv()) # Cache each taxon in memory
+
+
+# ---- Function to load CSVs and compare lat/lon values -----------------------
+get_obs_points <- function(taxon_key) {
+  if (is.na(taxon_key)) return(NULL)
+  key <- as.character(taxon_key)
+
+  if (exists(key, envir = .obs_cache, inherits = FALSE))
+    return(get(key, envir = .obs_cache, inherits = FALSE))
+
+  path <- file.path(obs_dir, paste0(key, ".csv"))
+  if (!file.exists(path)) return(NULL)
+
+  obs <- read_csv(
+    path,
+    col_types = cols(
+      .default = col_skip(),
+      decimalLongitude = col_double(),
+      decimalLatitude  = col_double()
+    ),
+    show_col_types = FALSE
+  ) |>
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) |>
+    distinct(decimalLongitude, decimalLatitude)
+
+  if (nrow(obs) == 0) return(NULL)
+
+  pts <- as.matrix(obs[, c("decimalLongitude", "decimalLatitude")])  # [lon, lat]
+  assign(key, pts, envir = .obs_cache)
+  pts
+}
+
+nearest_obs_distance_m <- function(sample_lat, sample_lon, taxon_key) {
+  if (is.na(sample_lat) || is.na(sample_lon) || is.na(taxon_key)) return(NA_real_)
+  pts <- get_obs_points(taxon_key)
+  if (is.null(pts)) return(NA_real_)
+  ref <- c(sample_lon, sample_lat)                 # distHaversine expects [lon, lat]
+  min(distHaversine(pts, ref))
+}
+
+# ---- Apply to data frame ----------------------------------------------
+# Create new column with distance from sample to nearest observation in metres
+data <- data |>
+  mutate(
+    nearest_obs_m = mapply(
+      nearest_obs_distance_m,
+      .data[[sample_lat_col]],
+      .data[[sample_lon_col]],
+      taxonKey
+    )
+  )
+
+# Create new boolean columns where TRUE if nearest distance is within 20km / 50km / 100km
+data$nearest_obs_20km <- data$nearest_obs_m < 20000
+data$nearest_obs_50km <- data$nearest_obs_m < 50000
+data$nearest_obs_100km <- data$nearest_obs_m < 100000
+
+```
+
+```{r}
+str(data)
+summary(data)
+```
+
+
+# eDNA Genus Completeness Calculations
+
+These CSVs are downloaded from https://shiny.cefe.cnrs.fr/GAPeDNA/ based on the following selections:
+
+* Taxon: Marine Fish
+* Resolution: Provinces
+* Mitochondrial Position: 12S + Primer Pair: Miya_12S
+* Mitochondrial Position: 16S + Primer Pair: DiBattista_16S
+
+Note: Client uses Berry_16S but that isn't an available filter. DiBattista appears to have the best coverage of the available primer pairs for 16S analysis so an assumption is made that this will provide sufficient estimation of comparable Berry_16S coverage.
+
+## Load data
+### Provide CSV inputs
+
+```{r}
+# Manually enter regions exactly as they appear in the filenames
+regions <- c(
+  "East Central Australian Shelf",
+  "Northeast Australian Shelf",
+  "Northwest Australian Shelf",
+  "Sahul Shelf",
+  "Southeast Australian Shelf",
+  "Southwest Australian Shelf",
+  "West Central Australian Shelf"
+)
+
+# Directory containing the CSVs
+data_dir <- "../Data"
+
+# Filename templates for each assay
+templates <- list(
+  `12S` = "Marine fish_Miya_12S_%s.csv",
+  `16S` = "Marine fish_DiBattista_16S_%s.csv"
+)
+
+# Function to simplify region names
+clean_name <- function(x) {
+  x <- gsub("Australian|Shelf", "", x, ignore.case = TRUE)
+  x <- gsub("\\s+", "", x)
+  make.names(x)
+}
+
+
+```
+
+### Process and join the CSV files
+
+```{r}
+
+merge_csvs <- function(assay=NULL, regions=NULL, data_dir=NULL, templates=NULL) {
+  
+  # Get filename template for the assay type and sanity-check it
+  template <- templates[[assay]]
+  if (is.null(template)) {
+    stop(sprintf("Assay '%s' not found in 'templates'.", assay))
+  }
+  if (!grepl("%s", template, fixed = TRUE)) {
+    stop(sprintf("Template for assay '%s' must include '%%s' for the region name.", assay))
+  }
+
+  # Build file paths for regions
+  files <- file.path(data_dir, sprintf(template, regions))
+
+  # Process column labels
+  region_labels <- vapply(regions, clean_name, character(1))
+
+  # Check existence and report any missing files clearly
+  if (any(!file.exists(files))) {
+    missing <- files[!file.exists(files)]
+    stop("These files do not exist:\n", paste(missing, collapse = "\n"))
+  }
+
+  # Read -> select -> rename for each region, then full-join by Species
+  df_list <- map2(files, region_labels, function(path, col_label) {
+    read_csv(path, show_col_types = FALSE) %>%
+      select(Species, Sequenced) %>%
+      rename(!!col_label := Sequenced)
+  })
+
+  merged <- reduce(df_list, ~ full_join(.x, .y, by = "Species")) %>%
+    relocate(Species, .before = 1)
+
+  merged
+}
+
+# 12S merged coverage (Species + one column per region)
+merged_12S_coverage <- merge_csvs("12S", regions, data_dir, templates)
+head(merged_12S_coverage)
+
+# 16S merged coverage
+merged_16S_coverage <- merge_csvs("16S", regions, data_dir, templates)
+head(merged_16S_coverage)
+
+```
+
+### Validate rows
+
+```{r}
+check_conflicts <- function(merged_df) {
+  conflicts <- merged_df %>%
+    rowwise() %>%
+    filter(
+      any(c_across(-Species) == "Yes", na.rm = TRUE) &
+      any(c_across(-Species) == "No",  na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  if (nrow(conflicts) == 0) {
+    message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
+  } else {
+    message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
+    print(conflicts)
+  }
+
+  invisible(conflicts)
+}
+
+# Check conflicts for 12S
+conflicts_12S <- check_conflicts(merged_12S_coverage)
+
+# Check conflicts for 16S
+conflicts_16S <- check_conflicts(merged_16S_coverage)
+
+```
+
+```{r}
+# Split the "Species" column as it actually contains Genus and Species together
+merged_12S_coverage <- merged_12S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+
+merged_16S_coverage <- merged_16S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+```
+
+Checking the warning rows to see what's happened. Looks like the species name is duplicated in most cases and in a small number of others it's a subspecies. Searching for these sub species on Obis.org they're not classed as valid (i.e. https://obis.org/taxon/236453) so the parent species should be sufficient for our needs.
+
+```{r}
+problem_rows_12 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
+problem_rows_16 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
+
+# Inspect them
+print(problem_rows_12)
+print(problem_rows_16)
+```
+
+
+## Calculate species DNA coverage
+
+### Generate 12S and 16S summaries
+
+```{r}
+calc_genus_coverage <- function(merged_df, region_cols = NULL) {
+  # If no region_cols are provided, use all except Species and Genus
+  if (is.null(region_cols)) {
+    region_cols <- setdiff(names(merged_df), c("Species", "Genus"))
+  }
+
+  # Add AllRegions column
+  merged_df <- merged_df %>%
+    rowwise() %>%
+    mutate(
+      AllRegions = if_else(
+        any(c_across(all_of(region_cols)) == "Yes", na.rm = TRUE),
+        "Yes",
+        "No"
+      )
+    ) %>%
+    ungroup()
+
+  # Summarise per Genus
+  genus_summary <- merged_df %>%
+    group_by(Genus) %>%
+    summarise(
+      TotalSpecies = n(),
+      YesCount = sum(AllRegions == "Yes"),
+      ProportionYes = YesCount / TotalSpecies,
+      .groups = "drop"
+    ) %>%
+    arrange(Genus)
+
+  genus_summary
+}
+
+genus_summary_12S <- calc_genus_coverage(merged_12S_coverage)
+genus_summary_16S <- calc_genus_coverage(merged_16S_coverage)
+
+```
+
+
+### Merge the 16S and 12S dataframes to compare
+
+```{r}
+# Rename columns to avoid problems when merging
+genus_summary_12S <- genus_summary_12S %>%
+  rename(
+    TotalSpecies_12S   = TotalSpecies,
+    YesCount_12S       = YesCount,
+    ProportionYes_12S  = ProportionYes
+  )
+
+genus_summary_16S <- genus_summary_16S %>%
+  rename(
+    TotalSpecies_16S   = TotalSpecies,
+    YesCount_16S       = YesCount,
+    ProportionYes_16S  = ProportionYes
+  )
+
+# Full join them by Genus so you get both sets of columns
+genus_summary_combined <- full_join(
+  genus_summary_12S,
+  genus_summary_16S,
+  by = "Genus"
+)
+
+# Reorder for readability
+genus_summary_combined <- genus_summary_combined %>%
+  select(
+    Genus,
+    TotalSpecies_12S, TotalSpecies_16S,
+    YesCount_12S, YesCount_16S, 
+    ProportionYes_12S, ProportionYes_16S
+  )
+
+genus_summary_combined
+
+# Check to see if the TotalSpecies value is consistent
+genus_summary_combined %>% filter(TotalSpecies_12S != TotalSpecies_16S)
+```
+
+### Consolidate duplicate columns
+
+```{r}
+# There's no mismatches so we can drop one of the columns and rename
+genus_summary_combined <- genus_summary_combined %>% select(-TotalSpecies_16S) %>% rename(TotalSpecies = TotalSpecies_12S)
+genus_summary_combined
+
+# See which species have the same vs. different data for 12S vs. 16S
+(diff_counts <- count(genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)))
+(same_counts <- count(genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)))
+genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)
+genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)
+```
+
+
+## Apply species DNA coverage value back to the original dataframe
+
+### Join to "data"
+
+```{r}
+# Create a new variable based on whether it's a 12 or 16 assay
+data <- data %>%
+  mutate(
+    Assay_Type = case_when(
+      Assay == "16SFish" ~ "16S",
+      Assay %in% c("MarVer1", "MiFishE2", "MiFishU", "MiFishUE", "MiFishUE2") ~ "12S",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# Move the new variable to be with the other assay variables
+data <- data %>% relocate(Assay_Type, .after = 4)
+str(data)
+
+# Double check the numbers add up
+data %>% count(Assay_Type)
+data %>% count(Assay)
+
+# Update the dataframe with the genus DNA coverage based on whether a 12S or 16S match was used
+data <- data %>%
+  left_join(
+    genus_summary_combined,
+    by = c("genus" = "Genus")
+  ) %>%
+  mutate(
+    Pct_GenusDNA_inDB = case_when(
+      Assay_Type == "12S" ~ ProportionYes_12S,
+      Assay_Type == "16S" ~ ProportionYes_16S,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  relocate(Pct_GenusDNA_inDB, .after = 9)
+
+str(data)
+```
+
+### Export out to CSV for use in other scripts
+
+```{r}
+write_csv(data, "../Data/data_GBIF_enriched.csv")
+```
