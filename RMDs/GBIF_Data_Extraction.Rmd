@@ -84,6 +84,32 @@ str(data)
 data <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
 ```
 
+```{r}
+data[] <- lapply(data, function(x) {
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x == ""] <- NA
+  }
+  x
+})
+
+# Drop columns that are all NA
+data <- data[, sapply(data, function(x) !all(is.na(x))), drop = FALSE]
+```
+
+```{r}
+na_report <- data.frame(
+  column       = keep_columns,
+  n_missing    = colSums(is.na(data)),
+  pct_missing  = round(100 * colMeans(is.na(data)), 1)
+)
+na_report <- na_report[order(-na_report$n_missing), ]
+print(na_report, row.names = FALSE)
+
+```
+
+
+
 ## Assay variables
 
 There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use as it does not contain any NA values.
