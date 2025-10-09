@@ -15,7 +15,7 @@ library(purrr)
 library(rlang)
 
 # ---- INPUTS ----
-file_path <- "allvoyages.csv"
+file_path <- "C:/Users/rosam/Downloads/all_voyages.csv/all_voyages.csv"
 
 # Read
 df <- read.csv(file_path, stringsAsFactors = FALSE, check.names = FALSE)
@@ -38,7 +38,7 @@ na_report <- tibble(
 na_report
 
 ```
-```{r2}
+```{r 2}
 library(dplyr)
 library(rlang)
 library(stringr)
@@ -102,93 +102,58 @@ names(result_tbl) <- tolower(gsub("\\s+", "_", names(result_tbl)))
 
 ```
 
-```{r3}
-# FAST AUS EEZ + PREFILTER FOR BIG DATA
+```{r 3}
+# FAST AUS BOX + PREFILTER FOR BIG DATA
+#
 
 suppressPackageStartupMessages({
   library(sf)
   library(dplyr)
 })
 
-# Fast + resilient AUS EEZ getter with cache and fallbacks
-get_aus_eez_fast <- function(cache = "aus_eez.rds",
-                             union = FALSE,
-                             eez_local = NULL,
-                             approx_bbox = c(105, -46, 170, -8)) {
-  # 0) Cache
-  if (file.exists(cache)) {
-    aus <- readRDS(cache)
-    if (is.na(st_crs(aus))) st_crs(aus) <- 4326 else aus <- st_transform(aus, 4326)
-    return(aus)
-  }
+# ---- Step 1: Simple Rough Australia Bounding Box ----
+get_aus_box_fast <- function() {
+  message("🌏 Using rough Australia bbox fallback.")
 
-  # 1) Local file (GeoPackage/GeoJSON/Shapefile)
-  if (!is.null(eez_local) && file.exists(eez_local)) {
-    aus <- tryCatch(st_read(eez_local, quiet = TRUE), error = function(e) NULL)
-    if (!is.null(aus) && inherits(aus, "sf") && nrow(aus) > 0) {
-      if (is.na(st_crs(aus))) st_crs(aus) <- 4326 else aus <- st_transform(aus, 4326)
-      if (isTRUE(union)) {
-        aus <- aus |>
-          st_make_valid() |>
-          dplyr::summarise(geometry = st_union(geometry), .groups = "drop") |>
-          st_as_sf()
-      }
-      saveRDS(aus, cache)
-      return(aus)
-    }
-  }
+  # Define the approximate bounding box coordinates
+  # xmin = 105°E, ymin = -46°S, xmax = 170°E, ymax = -8°S
+  # This rectangle covers the entire Australian continent and nearby waters.
+  approx_bbox <- c(105, -46, 170, -8)
 
-  # 2) WFS (Australia only), multiple CQL variants
-  base <- paste0(
-    "https://geo.vliz.be/geoserver/MarineRegions/wfs",
-    "?service=WFS&version=1.0.0&request=GetFeature",
-    "&typeName=MarineRegions:eez&outputFormat=application/json"
-  )
-  cql_candidates <- c(
-    "ISO_SOV1='AUS' OR ISO_TER1='AUS'",
-    "ISO_SOV2='AUS' OR ISO_TER2='AUS'",
-    "LOWER(GEONAME) LIKE '%australia%'"
-  )
-  aus <- NULL
-  for (cql in cql_candidates) {
-    url <- paste0(base, "&CQL_FILTER=", utils::URLencode(cql))
-    aus <- tryCatch(st_read(url, quiet = TRUE), error = function(e) NULL)
-    if (!is.null(aus) && inherits(aus, "sf") && nrow(aus) > 0) break
-  }
-  if (!is.null(aus) && inherits(aus, "sf") && nrow(aus) > 0) {
-    if (is.na(st_crs(aus))) st_crs(aus) <- 4326 else aus <- st_transform(aus, 4326)
-    saveRDS(aus, cache)
-    return(aus)
-  }
-
-  # 3) Fallback: fast bbox polygon
+  # Step 2: Build a rectangular polygon using those coordinates
   bb_poly <- st_polygon(list(rbind(
-    c(approx_bbox[1], approx_bbox[2]),
-    c(approx_bbox[3], approx_bbox[2]),
-    c(approx_bbox[3], approx_bbox[4]),
-    c(approx_bbox[1], approx_bbox[4]),
-    c(approx_bbox[1], approx_bbox[2])
+    c(approx_bbox[1], approx_bbox[2]),  # lower-left
+    c(approx_bbox[3], approx_bbox[2]),  # lower-right
+    c(approx_bbox[3], approx_bbox[4]),  # upper-right
+    c(approx_bbox[1], approx_bbox[4]),  # upper-left
+    c(approx_bbox[1], approx_bbox[2])   # close polygon
   )))
-  aus_bbox <- st_sfc(bb_poly, crs = 4326) |> st_as_sf()
-  saveRDS(aus_bbox, cache)
-  aus_bbox
+
+  # Step 3: Convert to a proper sf spatial object (WGS84 coordinate system)
+  aus_bbox <- st_as_sf(st_sfc(bb_poly, crs = 4326))
+  return(aus_bbox)
 }
 
-# ---- Fetch AUS EEZ (cached) ----
-aus_eez <- get_aus_eez_fast(cache = "aus_eez.rds", union = FALSE)
+# ---- Step 4: Create the bounding box polygon ----
+aus_box <- get_aus_box_fast()
 
-# ---- Ultra-fast prefilter + intersect for large df ----
-# assumes df has columns decimalLongitude and decimalLatitude
-bb <- sf::st_bbox(aus_eez)
+# ---- Step 5: Prefilter your dataset quickly ----
+# Assumes your dataframe is named `df` and includes decimalLongitude / decimalLatitude columns.
+# First, extract the bounding box limits for numeric filtering.
+bb <- sf::st_bbox(aus_box)
 
+# Step 6: Use a simple rectangular filter to remove coordinates outside the box.
+# This is the fastest possible spatial filter before doing expensive geometry joins.
 df_fast <- df %>%
   dplyr::filter(
+    !is.na(decimalLongitude), !is.na(decimalLatitude),
     decimalLongitude >= bb["xmin"],
     decimalLongitude <= bb["xmax"],
     decimalLatitude  >= bb["ymin"],
     decimalLatitude  <= bb["ymax"]
   )
 
+# Step 7: Convert the remaining rows into sf points (spatial objects)
 pts_fast <- sf::st_as_sf(
   df_fast,
   coords = c("decimalLongitude", "decimalLatitude"),
@@ -196,46 +161,97 @@ pts_fast <- sf::st_as_sf(
   remove = FALSE
 )
 
-pts_in_aus <- sf::st_join(pts_fast, aus_eez, left = FALSE)
+# Step 8: Keep only those points that lie within the Australia bounding box polygon
+pts_in_aus <- sf::st_join(pts_fast, aus_box, left = FALSE)
 
-# Optional: get back to data.frame rows
+# Step 9: Convert back to a plain dataframe so it’s easy to handle later
 rows_in_aus <- df_fast[as.integer(rownames(pts_in_aus)), , drop = FALSE]
 
-# Quick counts
+# ---- Step 10: Print quick summary counts ----
+# These counts help verify how many rows were kept at each stage.
 cat("# rows original:   ", nrow(df),        "\n")
 cat("# rows bbox-pass:  ", nrow(df_fast),   "\n")
 cat("# rows inside AUS: ", nrow(pts_in_aus), "\n")
 
 
+
+
 ```
+
 ```{r}
-#OBIS-only workflow: nearest occurrence distance & 50% km 
+
+# OBIS-only workflow: measure how close each sample is to known occurrences
+# ----------------------------------------------------------------------------
+# What this script does :
+# 1) Builds an “Area of Interest” (AOI) around your sampling sites in Australia
+#    using a convex hull + a safety buffer (so we include nearby waters).
+# 2) Extracts clean candidate species names from your data (Species + LCA list).
+# 3) Resolves each species to a stable WoRMS AphiaID (handles synonyms, typos).
+# 4) Fetches occurrence points for each species from OBIS (cached on disk).
+# 5) For every sample, computes the nearest distance to any OBIS record of its
+#    candidate species (and flags within 20/50/100 km).
+# 6) Summarises distances overall and per species, and saves tidy CSV outputs.
+##############################################################################
+
 suppressPackageStartupMessages({
   library(dplyr); library(tidyr); library(stringr); library(purrr); library(tibble)
   library(sf); library(geosphere); library(robis); library(readr); library(worrms)
 })
 
+# Expect an input data.frame `df` with decimalLongitude/decimalLatitude,
+# species, and/or Species_In_LCA columns available.
 
+###############################################################################
+# 1️⃣  DEFINE AREA OF INTEREST (AOI)
+# ----------------------------------------------------------------------------
+# Buffer distance is parameterised; change via options(obis_aoi_buffer_km = 100)
+# CRS and cache dir can also be tweaked via options().
+###############################################################################
+
+buffer_km <- getOption("obis_aoi_buffer_km", 100)   # default 100 km
+aoi_crs_m <- getOption("obis_aoi_crs", 3577)       # EPSG:3577 (Australia Albers, metres)
+simplify_tolerance_deg <- getOption("obis_aoi_simplify_deg", 0.00) # e.g., 0.01 ≈ ~1 km
+
+# Turn your rows into spatial points if you don’t already have `pts_in_aus`.
 pts_wgs84 <- if (exists("pts_in_aus")) {
   pts_in_aus
 } else {
-  sf::st_as_sf(df, coords = c("decimalLongitude","decimalLatitude"), crs = 4326, remove = FALSE)
+  sf::st_as_sf(df, coords = c("decimalLongitude","decimalLatitude"),
+               crs = 4326, remove = FALSE)
 }
 
-# Generous buffer so we actually capture nearby OBIS points
-buffer_km <- 300
-pts_aea   <- sf::st_transform(pts_wgs84, 3577)
-hull_aea  <- sf::st_convex_hull(sf::st_union(pts_aea))
-aoi_aea   <- sf::st_buffer(hull_aea, dist = buffer_km * 1000) |> sf::st_make_valid()
-aoi_wgs84 <- sf::st_transform(aoi_aea, 4326) |> sf::st_zm()
-aoi_wkt   <- sf::st_as_text(aoi_wgs84)
+# Defensive filtering of obviously invalid coordinates
+pts_wgs84 <- pts_wgs84 %>%
+  dplyr::filter(
+    !is.na(decimalLongitude), !is.na(decimalLatitude),
+    decimalLongitude >= -180, decimalLongitude <= 180,
+    decimalLatitude  >=  -90, decimalLatitude  <=  90
+  )
 
-# Flat data to work with
+# Build hull → buffer → convert back to WGS84 (lon/lat) → export as WKT text.
+pts_aea   <- sf::st_transform(pts_wgs84, aoi_crs_m)
+u         <- sf::st_union(pts_aea)
+# Fallback to union if convex hull fails (e.g., single point)
+hull_aea  <- tryCatch(sf::st_convex_hull(u), error = function(e) u)
+aoi_aea   <- sf::st_make_valid(sf::st_buffer(hull_aea, dist = buffer_km * 1000))
+aoi_wgs84 <- sf::st_zm(sf::st_transform(aoi_aea, 4326))
+
+# Optional: simplify AOI to speed WKT handling (0 disables)
+if (simplify_tolerance_deg > 0) {
+  aoi_wgs84 <- sf::st_simplify(aoi_wgs84, dTolerance = simplify_tolerance_deg)
+}
+
+aoi_wkt   <- sf::st_as_text(aoi_wgs84)   # OBIS understands WKT strings
+
+###############################################################################
+# 2️⃣  PREPARE FLAT DATA
+# ----------------------------------------------------------------------------
+
 data_obis <- if (exists("rows_in_aus")) rows_in_aus else if (exists("pts_in_aus")) {
   sf::st_drop_geometry(pts_in_aus)
 } else sf::st_drop_geometry(pts_wgs84)
 
-# Ensure required columns exist
+# Ensure required columns exist and have the right type.
 for (nm in c("species","Species_In_LCA")) {
   if (!nm %in% names(data_obis)) data_obis[[nm]] <- NA_character_
   data_obis[[nm]] <- as.character(data_obis[[nm]])
@@ -244,10 +260,13 @@ for (nm in c("decimalLongitude","decimalLatitude")) {
   if (!nm %in% names(data_obis)) data_obis[[nm]] <- NA_real_
 }
 
+###############################################################################
+# 3️⃣  EXTRACT CANDIDATE SPECIES NAMES (binomials only)
+# ----------------------------------------------------------------------------
+
 `%||%` <- function(a,b) if (!is.null(a)) a else b
 is_binomial <- function(x) is.character(x) && nzchar(x) && grepl("\\S+\\s+\\S+", x)
 
-# If species != "dropped" and looks binomial -> use it; else split Species_In_LCA
 extract_candidates <- function(species, Species_In_LCA) {
   sp  <- str_squish(species %||% "")
   sil <- str_squish(Species_In_LCA %||% "")
@@ -260,21 +279,28 @@ extract_candidates <- function(species, Species_In_LCA) {
   character(0)
 }
 
-row_candidates <- pmap(
+data_obis$candidates <- pmap(
   data_obis[, c("species","Species_In_LCA")],
-  function(species, Species_In_LCA) extract_candidates(species, Species_In_LCA)
+  extract_candidates
 )
-data_obis$candidates <- row_candidates
 
-# ----------------- WoRMS AphiaID resolve + OBIS fetch (AOI -> global) -----------------
+# De-duplicate candidate lists (micro-optimisation for fewer OBIS calls)
+data_obis$candidates <- purrr::map(data_obis$candidates, ~ unique(.x[nchar(.x) > 0]))
+
+###############################################################################
+# 4️⃣  RESOLVE WORMS APHIAID + FETCH OBIS RECORDS (with caching)
+# ----------------------------------------------------------------------------
+
+# In-memory cache for AphiaID lookups.
 .aphia_cache <- new.env(parent = emptyenv())
+
 resolve_aphia <- function(scientific_name) {
   if (!nzchar(scientific_name)) return(NA_integer_)
   key <- tolower(scientific_name)
   if (exists(key, envir = .aphia_cache, inherits = FALSE)) return(get(key, .aphia_cache))
 
   id <- NA_integer_
-  # try exact, then fuzzy/records if needed
+  # Try exact first; if that fails, pull candidate records and prefer accepted species.
   exact <- tryCatch(wm_name2id(scientificname = scientific_name), error = function(e) NA_integer_)
   if (!is.na(exact)) {
     id <- suppressWarnings(as.integer(exact))
@@ -290,37 +316,37 @@ resolve_aphia <- function(scientific_name) {
   id
 }
 
-# Disk cache for species points (OBIS-only)
-occ_dir <- "../Data/SpeciesPoints_OBIS"
+# Explicit, configurable cache directory for per-species OBIS CSVs
+occ_dir <- getOption("obis_occ_dir", "../Data/SpeciesPoints_OBIS")
 dir.create(occ_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Fetch OBIS points for a species: prefer AOI; if empty, try global (still OBIS)
+# Gentle wrapper to handle OBIS hiccups quietly
+safe_occurrence <- function(...) tryCatch(robis::occurrence(...), error = function(e) NULL)
+
+# Get OBIS occurrence points for one species: AOI first; if empty, try global.
 get_species_points_obis <- function(sp, wkt = NULL) {
   if (!nzchar(sp)) return(tibble())
   safe <- gsub("[^A-Za-z0-9_]+","_", sp)
   out_path <- file.path(occ_dir, paste0(safe, ".csv"))
 
-  # Load cache if present
+  # Reuse cached CSV if present.
   if (file.exists(out_path)) {
     df <- suppressMessages(readr::read_csv(out_path, show_col_types = FALSE))
     return(df %>% filter(!is.na(decimalLongitude), !is.na(decimalLatitude)))
   }
 
   fetch_once <- function(geom = NULL, aphia = NA_integer_) {
-    if (!is.na(aphia)) {
-      tryCatch(robis::occurrence(taxonid = aphia, geometry = geom), error = function(e) NULL)
-    } else {
-      tryCatch(robis::occurrence(scientificname = sp, geometry = geom), error = function(e) NULL)
-    }
+    if (!is.na(aphia)) safe_occurrence(taxonid = aphia, geometry = geom)
+    else               safe_occurrence(scientificname = sp, geometry = geom)
   }
 
   aphia <- resolve_aphia(sp)
 
-  # 1) AOI first
+  # Prefer AOI-constrained fetch to keep results tight; fall back to global if empty.
   ob <- fetch_once(wkt, aphia)
-  # 2) If empty, try global OBIS
   if (is.null(ob) || !nrow(ob)) ob <- fetch_once(NULL, aphia)
 
+  # If still empty, write an empty CSV so we don’t retry this species repeatedly.
   if (is.null(ob) || !nrow(ob)) {
     readr::write_csv(tibble(species = character(), decimalLongitude = double(), decimalLatitude = double()),
                      out_path)
@@ -337,55 +363,134 @@ get_species_points_obis <- function(sp, wkt = NULL) {
     distinct()
 
   readr::write_csv(df, out_path)
+
+  # small politeness pause to be nice to OBIS
+  Sys.sleep(getOption("obis_pause_sec", 0.1))
+
   df
 }
 
-# ----------------- Build species set & index (OBIS-only) -----------------
-uniq_species <- unique(unlist(row_candidates, use.names = FALSE))
+###############################################################################
+# 5️⃣  BUILD SPECIES LIST + LIGHTWEIGHT INDEX
+# ----------------------------------------------------------------------------
+
+uniq_species <- unique(unlist(data_obis$candidates, use.names = FALSE))
 uniq_species <- uniq_species[nzchar(uniq_species)]
 
 message("Unique species (OBIS-only) to fetch: ", length(uniq_species))
+
 index_tbl <- tibble(candidate = uniq_species) %>%
   mutate(n_rows = map_int(candidate, ~ nrow(get_species_points_obis(.x, aoi_wkt))))
 readr::write_csv(index_tbl, file.path(occ_dir, "_index.csv"))
 
-# ----------------- Distances to nearest OBIS occurrence -----------------
+###############################################################################
+###############################################################################
+# 6) NEAREST-DISTANCE CALCULATION PER SAMPLE
+# ----------------------------------------------------------------------------
+# - nearest_obis_m:        minimum distance (metres) to any candidate's OBIS point
+# - nearest_obis_min_km:   same as above, in kilometres (rounded)
+# - nearest_obis_all_km:   comma-separated per-candidate minimum distances (km),
+#                          in the SAME ORDER as `candidates` / Species_In_LCA
+# - obis_within_*km:       TRUE/FALSE using the minimum distance
+# - obis_within_*km_all:   comma-separated TRUE/FALSE per candidate (optional)
+###############################################################################
+
+# Small in-memory cache so we don't re-read the same species CSV repeatedly
 .pts_cache <- new.env(parent = emptyenv())
 get_cached_pts <- function(sp) {
-  if (exists(sp, envir = .pts_cache)) return(get(sp, envir = .pts_cache))
+  if (exists(sp, envir = .pts_cache, inherits = FALSE)) return(get(sp, .pts_cache))
   df <- get_species_points_obis(sp, aoi_wkt)
   assign(sp, df, envir = .pts_cache)
   df
 }
 
-nearest_to_set_m <- function(sample_lon, sample_lat, species_vec) {
+# Minimum distance (metres) from a sample to ANY of the candidates' OBIS points
+dist_min_m <- function(sample_lon, sample_lat, species_vec) {
   if (is.na(sample_lon) || is.na(sample_lat) || length(species_vec) == 0) return(NA_real_)
   ref <- c(sample_lon, sample_lat) # (lon, lat)
-  mins <- map_dbl(species_vec, function(sp) {
+
+  mins <- purrr::map_dbl(species_vec, function(sp) {
     pts <- get_cached_pts(sp)
     if (!nrow(pts)) return(Inf)
-    geosphere::distHaversine(as.matrix(pts[, c("decimalLongitude","decimalLatitude")]), ref) |> min(na.rm = TRUE)
+    geosphere::distHaversine(
+      as.matrix(pts[, c("decimalLongitude","decimalLatitude")]),
+      ref
+    ) |> min(na.rm = TRUE)
   })
+
   d <- suppressWarnings(min(mins, na.rm = TRUE))
   if (is.infinite(d)) NA_real_ else d
 }
 
+# Per-candidate minimum distances (kilometres), preserving the input order
+dist_each_km <- function(sample_lon, sample_lat, species_vec) {
+  if (is.na(sample_lon) || is.na(sample_lat) || length(species_vec) == 0) return(numeric(0))
+  ref <- c(sample_lon, sample_lat)
+
+  purrr::map_dbl(species_vec, function(sp) {
+    pts <- get_cached_pts(sp)
+    if (!nrow(pts)) return(Inf)
+    m <- geosphere::distHaversine(
+      as.matrix(pts[, c("decimalLongitude","decimalLatitude")]),
+      ref
+    ) |> min(na.rm = TRUE)
+    m / 1000  # km
+  })
+}
+
+# Compute min distance and per-candidate distances
 data_obis$nearest_obis_m <- mapply(
-  nearest_to_set_m,
+  dist_min_m,
   data_obis$decimalLongitude,
   data_obis$decimalLatitude,
   data_obis$candidates,
   SIMPLIFY = TRUE
 )
 
+data_obis$nearest_obis_all_km <- mapply(
+  function(lon, lat, vec) {
+    d <- dist_each_km(lon, lat, vec)
+    if (!length(d)) return(NA_character_)
+    paste0(round(d, 2), collapse = ",")
+  },
+  data_obis$decimalLongitude,
+  data_obis$decimalLatitude,
+  data_obis$candidates,
+  SIMPLIFY = TRUE
+)
+
+# Convenience flags: min-distance thresholds (as before)
 data_obis <- data_obis %>%
-  mutate(
-    obis_within_20km  = nearest_obis_m <  20e3,
-    obis_within_50km  = nearest_obis_m <  50e3,
-    obis_within_100km = nearest_obis_m < 100e3
+  dplyr::mutate(
+    nearest_obis_min_km = round(nearest_obis_m / 1000, 2),
+    obis_within_20km    = nearest_obis_m <  20e3,
+    obis_within_50km    = nearest_obis_m <  50e3,
+    obis_within_100km   = nearest_obis_m < 100e3
   )
 
-# ----------------- 50% probability distance (km) -----------------
+# OPTIONAL: per-candidate TRUE/FALSE strings for the same thresholds,
+# aligned with the order in `nearest_obis_all_km` / `candidates`.
+split_to_num <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(numeric(0))
+  as.numeric(strsplit(x, ",", fixed = TRUE)[[1]])
+}
+mk_flag_str <- function(km_str, cutoff_km) {
+  d <- split_to_num(km_str)
+  if (!length(d)) return(NA_character_)
+  paste0(ifelse(is.finite(d) & d < cutoff_km, "TRUE", "FALSE"), collapse = ",")
+}
+
+data_obis <- data_obis %>%
+  dplyr::mutate(
+    obis_within_20km_all  = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 20),
+    obis_within_50km_all  = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 50),
+    obis_within_100km_all = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 100)
+  )
+
+###############################################################################
+#  7️⃣  SUMMARIES: OVERALL + PER-SPECIES QUANTILES
+# ----------------------------------------------------------------------------
+
 overall_50pct_km <- stats::quantile(data_obis$nearest_obis_m, 0.5, na.rm = TRUE) / 1000
 message(sprintf("Overall 50%% probability distance (OBIS-only): %.1f km", overall_50pct_km))
 
@@ -404,11 +509,13 @@ per_species_quant_obis <- data_obis %>%
   ) %>%
   arrange(desc(n_rows))
 
-# Save
+###############################################################################
+# 8️⃣  SAVE OUTPUTS + LIGHT DIAGNOSTICS
+# ----------------------------------------------------------------------------
+
 readr::write_csv(data_obis,              "../Data/data_OBIS_enriched_distances.csv")
 readr::write_csv(per_species_quant_obis, "../Data/OBIS_distance_quantiles_per_species.csv")
 
-# Diagnostics
 cat("\nExample candidates (first 3 rows):\n"); print(head(data_obis$candidates, 3))
 if (length(uniq_species)) {
   test_sp <- uniq_species[1]; tmp <- get_cached_pts(test_sp)
@@ -419,23 +526,103 @@ cat(sprintf("\nRows with OBIS distances: %d / %d\n",
 summary(data_obis$nearest_obis_m)
 
 
+
 ```
 
-```{r4}
-# FishBase + OBIS 
-
+```{r fishbase_obis_evidence}
+# ================================================================
+# CONTINUATION: FishBase + OBIS evidence for Australia
+# ---------------------------------------------------------------
 suppressPackageStartupMessages({
-  library(dplyr)
-  library(readr)
-  library(stringr)
-  library(purrr)
-  library(tidyr)
-  library(tibble)
-  library(arrow)
-  library(sf)
+  library(dplyr); library(readr); library(stringr); library(tidyr)
+  library(tibble); library(purrr); library(arrow); library(sf)
 })
 
-# ---------- Load FishBase cached parquet mirrors ----------
+# ---------- Use existing Australia polygon / OBIS cache if available ----------
+if (!exists("aus_box")) {
+  # fast rectangular fallback (same as earlier bbox)
+  get_aus_box_fast <- function() {
+    approx_bbox <- c(105, -46, 170, -8)  # xmin, ymin, xmax, ymax
+    bb_poly <- st_polygon(list(rbind(
+      c(approx_bbox[1], approx_bbox[2]),
+      c(approx_bbox[3], approx_bbox[2]),
+      c(approx_bbox[3], approx_bbox[4]),
+      c(approx_bbox[1], approx_bbox[4]),
+      c(approx_bbox[1], approx_bbox[2])
+    )))
+    st_as_sf(st_sfc(bb_poly, crs = 4326))
+  }
+  aus_box <- get_aus_box_fast()
+}
+
+occ_dir <- getOption("obis_occ_dir", "../Data/SpeciesPoints_OBIS")
+dir.create(occ_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- Pick a source table that actually exists ----------
+# Prefer rows filtered to Australia if you ran the bbox step; else fall back to df/result_tbl.
+src <- if (exists("rows_in_aus")) {
+  rows_in_aus
+} else if (exists("result_tbl")) {
+  result_tbl
+} else {
+  df
+}
+
+# Helper to safely pick the first existing column name from a set
+pick_col <- function(dat, candidates) {
+  nm <- intersect(candidates, names(dat))[1]
+  if (is.na(nm)) NULL else nm
+}
+
+# Identify column names for species list and ASV/sample (handles both original and snake_case)
+col_species_lca <- pick_col(src, c("Species_In_LCA","species_in_lca","LCA","lca","species"))
+col_asv         <- pick_col(src, c("ASV","asv"))
+col_sample      <- pick_col(src, c("sample","Sample","SAMPLE"))
+
+# If no species column exists, create an empty one to keep pipeline robust
+if (is.null(col_species_lca)) {
+  src$Species_In_LCA <- NA_character_
+  col_species_lca <- "Species_In_LCA"
+}
+
+# ---------- Build unique, well-formed candidate names (binomials) ----------
+# Vectorized: returns a logical vector the same length as x
+is_binomial <- function(x) {
+  x <- as.character(x)
+  !is.na(x) & nzchar(x) & grepl("\\S+\\s+\\S+", x)
+}
+
+all_candidates <- src %>%
+  transmute(Species_In_LCA = .data[[col_species_lca]]) %>%
+  filter(!is.na(Species_In_LCA), nzchar(Species_In_LCA)) %>%
+  separate_rows(Species_In_LCA, sep = ",") %>%
+  mutate(candidate = stringr::str_squish(Species_In_LCA)) %>%
+  filter(is_binomial(candidate)) %>%
+  distinct(candidate)
+
+
+# Shortcut: if you already wrote per-species OBIS CSVs in occ_dir, we can
+# check AU presence by intersecting those cached points with aus_box.
+# If a CSV is missing, we treat it as zero hits (you can run the OBIS fetcher first).
+
+read_cached_obis <- function(sp, occ_dir) {
+  safe <- gsub("[^A-Za-z0-9_]+","_", sp)
+  path <- file.path(occ_dir, paste0(safe, ".csv"))
+  if (!file.exists(path)) return(tibble(decimalLongitude = numeric(), decimalLatitude = numeric()))
+  suppressMessages(readr::read_csv(path, show_col_types = FALSE)) %>%
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
+}
+
+obis_hits_in_aus_box <- function(sp, aus_poly, occ_dir) {
+  pts <- read_cached_obis(sp, occ_dir)
+  if (!nrow(pts)) return(0L)
+  sfpts <- sf::st_as_sf(pts, coords = c("decimalLongitude","decimalLatitude"), crs = 4326, remove = FALSE)
+  sfpts <- suppressWarnings(sf::st_make_valid(sfpts))
+  hits  <- suppressWarnings(sf::st_intersects(sfpts, aus_poly, sparse = TRUE))
+  sum(lengths(hits) > 0L)
+}
+
+# ---------- FishBase country presence (AU) via parquet mirrors ----------
 cache_dir <- "fishbase_cache"; dir.create(cache_dir, showWarnings = FALSE)
 
 dl <- function(url, fname) {
@@ -464,21 +651,11 @@ country_df <- read_parquet(country_path)
 spec_col  <- grep("spec",  names(country_df), ignore.case = TRUE, value = TRUE)[1]
 ccode_col <- grep("c[_]?code", names(country_df), ignore.case = TRUE, value = TRUE)[1]
 
-country_df <- country_df %>%
-  select(SpecCode = all_of(spec_col), C_Code = all_of(ccode_col))
-au_df <- country_df %>% filter(C_Code %in% c(36, "36", "036"))
-
-`%||%` <- function(a,b) if (is.null(a) || is.na(a)) b else a
-
-# ---------- Helper functions ----------
-is_in_au <- function(code) {
-  if (is.na(code)) return(NA)
-  any(au_df$SpecCode == code)
-}
+country_df <- country_df %>% select(SpecCode = all_of(spec_col), C_Code = all_of(ccode_col))
+au_df      <- country_df %>% filter(C_Code %in% c(36, "36", "036"))
 
 name_to_speccode <- function(sciname) {
-  sciname <- str_squish(sciname %||% "")
-  if (sciname == "" || !str_detect(sciname, "\\s")) return(NA_integer_)
+  if (is.na(sciname) || !nzchar(sciname) || !grepl("\\s", sciname)) return(NA_integer_)
   parts <- str_split(sciname, "\\s+", n = 2, simplify = TRUE)
   G <- parts[1,1]; S <- parts[1,2]
   hit <- species_df %>% filter(Genus == G, Species == S) %>% slice_head(n = 1)
@@ -487,100 +664,46 @@ name_to_speccode <- function(sciname) {
   if (nrow(syn) == 1) return(syn$SpecCode[[1]])
   NA_integer_
 }
+is_in_au <- function(code) if (is.na(code)) NA else any(au_df$SpecCode == code)
 
-speccode_to_name <- function(code) {
-  if (is.na(code)) return(NA_character_)
-  r <- species_df %>% filter(SpecCode == code) %>% slice_head(n = 1)
-  if (nrow(r) == 0) return(NA_character_)
-  paste(r$Genus, r$Species)
-}
-
-# ---------- OBIS helper ----------
-.obis_cache <- new.env(parent = emptyenv())
-
-obis_hits_in_au_eez <- function(species_name, aus_eez) {
-  if (is.null(species_name) || is.na(species_name) || !nzchar(species_name)) return(0L)
-  key <- tolower(trimws(species_name))
-  if (exists(key, envir = .obis_cache)) return(get(key, envir = .obis_cache))
-
-  obs <- tryCatch(robis::occurrence(species_name), error = function(e) NULL)
-  if (is.null(obs) || nrow(obs) == 0) { assign(key, 0L, envir = .obis_cache); return(0L) }
-
-  obs <- obs %>% filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
-  if (!nrow(obs)) { assign(key, 0L, envir = .obis_cache); return(0L) }
-
-  pts <- sf::st_as_sf(obs, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326, remove = FALSE)
-  pts <- suppressWarnings(sf::st_make_valid(pts))
-  hits <- suppressWarnings(sf::st_intersects(pts, aus_eez, sparse = TRUE))
-  n <- sum(lengths(hits) > 0)
-  assign(key, as.integer(n), envir = .obis_cache)
-  as.integer(n)
-}
-
-# ---------- TRUE/FALSE table for Species_In_LCA ----------
-src <- df_in_aus
-if (!"Species_In_LCA" %in% names(src)) src$Species_In_LCA <- NA_character_
-
-# Extract unique binomial candidates
-all_candidates <- src %>%
-  select(Species_In_LCA) %>%
-  filter(!is.na(Species_In_LCA), nzchar(Species_In_LCA)) %>%
-  separate_rows(Species_In_LCA, sep = ",") %>%
-  mutate(candidate = str_squish(Species_In_LCA)) %>%
-  filter(str_detect(candidate, "\\S+\\s+\\S+")) %>%
-  distinct(candidate)
-
-# Main truth table
+# ---------- Build the truth table (one row per species) ----------
 species_truth <- all_candidates %>%
   mutate(
     SpecCode       = map_int(candidate, name_to_speccode),
     fb_in_AU       = map_lgl(SpecCode, is_in_au),
-    obis_hits      = map_int(candidate, ~ obis_hits_in_au_eez(.x, aus_eez)),
-    obis_in_AU_EEZ = obis_hits > 0L,
-    any_evidence   = fb_in_AU | obis_in_AU_EEZ
+    obis_hits_AU   = map_int(candidate, ~ obis_hits_in_aus_box(.x, aus_box, occ_dir)),
+    obis_in_AU     = obis_hits_AU > 0L,
+    any_evidence   = fb_in_AU | obis_in_AU
   ) %>%
-  select(candidate, SpecCode, fb_in_AU, obis_in_AU_EEZ, obis_hits, any_evidence)
+  select(candidate, SpecCode, fb_in_AU, obis_in_AU, obis_hits_AU, any_evidence) %>%
+  arrange(desc(any_evidence), desc(obis_hits_AU), desc(fb_in_AU), candidate)
 
-write_csv(species_truth, "species_in_LCA_truth_table.csv")
+readr::write_csv(species_truth, "species_in_LCA_truth_table.csv")
 
-# Per-row TRUE/FALSE expansion
+# ---------- Expand back to per-row � candidate ----------
 per_row_truth <- src %>%
-  mutate(row_id = row_number()) %>%
-  select(row_id, ASV = all_of(intersect("ASV", names(.))),
-         sample = all_of(intersect("sample", names(.))),
-         Species_In_LCA) %>%
+  mutate(row_id = dplyr::row_number()) %>%
+  transmute(
+    row_id,
+    ASV    = if (!is.null(col_asv))    .data[[col_asv]]    else NA,
+    sample = if (!is.null(col_sample)) .data[[col_sample]] else NA,
+    Species_In_LCA = .data[[col_species_lca]]
+  ) %>%
+  filter(!is.na(Species_In_LCA), nzchar(Species_In_LCA)) %>%
   separate_rows(Species_In_LCA, sep = ",") %>%
   mutate(candidate = str_squish(Species_In_LCA)) %>%
-  filter(str_detect(candidate, "\\S+\\s+\\S+")) %>%
+  filter(is_binomial(candidate)) %>%
   left_join(species_truth, by = "candidate") %>%
-  select(row_id, ASV, sample, candidate, fb_in_AU, obis_in_AU_EEZ, obis_hits, any_evidence)
+  select(row_id, ASV, sample, candidate, fb_in_AU, obis_in_AU, obis_hits_AU, any_evidence)
 
-write_csv(per_row_truth, "species_in_LCA_truth_per_row.csv")
+readr::write_csv(per_row_truth, "species_in_LCA_truth_per_row.csv")
 
-cat("\n# species in Species_In_LCA (unique):", nrow(species_truth), "\n")
+# ---------- Quick diagnostics ----------
+cat("\n# unique candidates:", nrow(species_truth), "\n")
 print(head(species_truth, 10))
-cat("\n# per-row × candidate rows:", nrow(per_row_truth), "\n")
+cat("\n# per-row � candidate rows:", nrow(per_row_truth), "\n")
 print(head(per_row_truth, 10))
-
-```
-
-
-```{r}
-# Quick overview
-cat("\nUnique species in truth table:", nrow(species_truth), "\n")
-cat("Rows in per-row table:", nrow(per_row_truth), "\n")
-
-# Evidence breakdown
-table(species_truth$any_evidence, useNA = "ifany")
-table(species_truth$fb_in_AU, useNA = "ifany")
-table(species_truth$obis_in_AU_EEZ, useNA = "ifany")
-# See first few
-head(species_truth, 10)
-
-# Filter known Australian fish (for sanity check)
-species_truth %>% filter(grepl("Thunnus|Lutjanus|Scomberomorus|Auxis", candidate, ignore.case = TRUE))
-summary(species_truth$obis_hits)
-head(per_row_truth, 10)
+# ================================================================
 
 ```
 
