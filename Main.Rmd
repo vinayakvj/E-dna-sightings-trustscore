@@ -113,10 +113,10 @@ suppressPackageStartupMessages({
 
 # ---- Step 1: Simple Rough Australia Bounding Box ----
 get_aus_box_fast <- function() {
-  message("🌏 Using rough Australia bbox fallback.")
+  message("ðŸŒ Using rough Australia bbox fallback.")
 
   # Define the approximate bounding box coordinates
-  # xmin = 105°E, ymin = -46°S, xmax = 170°E, ymax = -8°S
+  # xmin = 105Â°E, ymin = -46Â°S, xmax = 170Â°E, ymax = -8Â°S
   # This rectangle covers the entire Australian continent and nearby waters.
   approx_bbox <- c(105, -46, 170, -8)
 
@@ -164,7 +164,7 @@ pts_fast <- sf::st_as_sf(
 # Step 8: Keep only those points that lie within the Australia bounding box polygon
 pts_in_aus <- sf::st_join(pts_fast, aus_box, left = FALSE)
 
-# Step 9: Convert back to a plain dataframe so it’s easy to handle later
+# Step 9: Convert back to a plain dataframe so itâ€™s easy to handle later
 rows_in_aus <- df_fast[as.integer(rownames(pts_in_aus)), , drop = FALSE]
 
 # ---- Step 10: Print quick summary counts ----
@@ -183,7 +183,7 @@ cat("# rows inside AUS: ", nrow(pts_in_aus), "\n")
 # OBIS-only workflow: measure how close each sample is to known occurrences
 # ----------------------------------------------------------------------------
 # What this script does :
-# 1) Builds an “Area of Interest” (AOI) around your sampling sites in Australia
+# 1) Builds an â€œArea of Interestâ€ (AOI) around your sampling sites in Australia
 #    using a convex hull + a safety buffer (so we include nearby waters).
 # 2) Extracts clean candidate species names from your data (Species + LCA list).
 # 3) Resolves each species to a stable WoRMS AphiaID (handles synonyms, typos).
@@ -202,7 +202,7 @@ suppressPackageStartupMessages({
 # species, and/or Species_In_LCA columns available.
 
 ###############################################################################
-# 1️⃣  DEFINE AREA OF INTEREST (AOI)
+# 1ï¸âƒ£  DEFINE AREA OF INTEREST (AOI)
 # ----------------------------------------------------------------------------
 # Buffer distance is parameterised; change via options(obis_aoi_buffer_km = 100)
 # CRS and cache dir can also be tweaked via options().
@@ -210,9 +210,9 @@ suppressPackageStartupMessages({
 
 buffer_km <- getOption("obis_aoi_buffer_km", 100)   # default 100 km
 aoi_crs_m <- getOption("obis_aoi_crs", 3577)       # EPSG:3577 (Australia Albers, metres)
-simplify_tolerance_deg <- getOption("obis_aoi_simplify_deg", 0.00) # e.g., 0.01 ≈ ~1 km
+simplify_tolerance_deg <- getOption("obis_aoi_simplify_deg", 0.00) # e.g., 0.01 â‰ˆ ~1 km
 
-# Turn your rows into spatial points if you don’t already have `pts_in_aus`.
+# Turn your rows into spatial points if you donâ€™t already have `pts_in_aus`.
 pts_wgs84 <- if (exists("pts_in_aus")) {
   pts_in_aus
 } else {
@@ -228,7 +228,7 @@ pts_wgs84 <- pts_wgs84 %>%
     decimalLatitude  >=  -90, decimalLatitude  <=  90
   )
 
-# Build hull → buffer → convert back to WGS84 (lon/lat) → export as WKT text.
+# Build hull â†’ buffer â†’ convert back to WGS84 (lon/lat) â†’ export as WKT text.
 pts_aea   <- sf::st_transform(pts_wgs84, aoi_crs_m)
 u         <- sf::st_union(pts_aea)
 # Fallback to union if convex hull fails (e.g., single point)
@@ -244,7 +244,7 @@ if (simplify_tolerance_deg > 0) {
 aoi_wkt   <- sf::st_as_text(aoi_wgs84)   # OBIS understands WKT strings
 
 ###############################################################################
-# 2️⃣  PREPARE FLAT DATA
+# 2ï¸âƒ£  PREPARE FLAT DATA
 # ----------------------------------------------------------------------------
 
 data_obis <- if (exists("rows_in_aus")) rows_in_aus else if (exists("pts_in_aus")) {
@@ -261,7 +261,7 @@ for (nm in c("decimalLongitude","decimalLatitude")) {
 }
 
 ###############################################################################
-# 3️⃣  EXTRACT CANDIDATE SPECIES NAMES (binomials only)
+# 3ï¸âƒ£  EXTRACT CANDIDATE SPECIES NAMES (binomials only)
 # ----------------------------------------------------------------------------
 
 `%||%` <- function(a,b) if (!is.null(a)) a else b
@@ -288,7 +288,7 @@ data_obis$candidates <- pmap(
 data_obis$candidates <- purrr::map(data_obis$candidates, ~ unique(.x[nchar(.x) > 0]))
 
 ###############################################################################
-# 4️⃣  RESOLVE WORMS APHIAID + FETCH OBIS RECORDS (with caching)
+# 4ï¸âƒ£  RESOLVE WORMS APHIAID + FETCH OBIS RECORDS (with caching)
 # ----------------------------------------------------------------------------
 
 # In-memory cache for AphiaID lookups.
@@ -346,7 +346,7 @@ get_species_points_obis <- function(sp, wkt = NULL) {
   ob <- fetch_once(wkt, aphia)
   if (is.null(ob) || !nrow(ob)) ob <- fetch_once(NULL, aphia)
 
-  # If still empty, write an empty CSV so we don’t retry this species repeatedly.
+  # If still empty, write an empty CSV so we donâ€™t retry this species repeatedly.
   if (is.null(ob) || !nrow(ob)) {
     readr::write_csv(tibble(species = character(), decimalLongitude = double(), decimalLatitude = double()),
                      out_path)
@@ -371,7 +371,7 @@ get_species_points_obis <- function(sp, wkt = NULL) {
 }
 
 ###############################################################################
-# 5️⃣  BUILD SPECIES LIST + LIGHTWEIGHT INDEX
+# 5ï¸âƒ£  BUILD SPECIES LIST + LIGHTWEIGHT INDEX
 # ----------------------------------------------------------------------------
 
 uniq_species <- unique(unlist(data_obis$candidates, use.names = FALSE))
@@ -488,7 +488,7 @@ data_obis <- data_obis %>%
   )
 
 ###############################################################################
-#  7️⃣  SUMMARIES: OVERALL + PER-SPECIES QUANTILES
+#  7ï¸âƒ£  SUMMARIES: OVERALL + PER-SPECIES QUANTILES
 # ----------------------------------------------------------------------------
 
 overall_50pct_km <- stats::quantile(data_obis$nearest_obis_m, 0.5, na.rm = TRUE) / 1000
@@ -510,7 +510,7 @@ per_species_quant_obis <- data_obis %>%
   arrange(desc(n_rows))
 
 ###############################################################################
-# 8️⃣  SAVE OUTPUTS + LIGHT DIAGNOSTICS
+# 8ï¸âƒ£  SAVE OUTPUTS + LIGHT DIAGNOSTICS
 # ----------------------------------------------------------------------------
 
 readr::write_csv(data_obis,              "../Data/data_OBIS_enriched_distances.csv")
@@ -680,7 +680,7 @@ species_truth <- all_candidates %>%
 
 readr::write_csv(species_truth, "species_in_LCA_truth_table.csv")
 
-# ---------- Expand back to per-row � candidate ----------
+# ---------- Expand back to per-row × candidate ----------
 per_row_truth <- src %>%
   mutate(row_id = dplyr::row_number()) %>%
   transmute(
@@ -701,7 +701,7 @@ readr::write_csv(per_row_truth, "species_in_LCA_truth_per_row.csv")
 # ---------- Quick diagnostics ----------
 cat("\n# unique candidates:", nrow(species_truth), "\n")
 print(head(species_truth, 10))
-cat("\n# per-row � candidate rows:", nrow(per_row_truth), "\n")
+cat("\n# per-row × candidate rows:", nrow(per_row_truth), "\n")
 print(head(per_row_truth, 10))
 # ================================================================
 
