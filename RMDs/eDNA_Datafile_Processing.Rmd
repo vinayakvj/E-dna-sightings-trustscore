@@ -9,7 +9,7 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-# Introduction
+# INTRODUCTION
 
 This markdown file uses the GBIF API to extract a variety of information and uses it to enrich our original dataset. The main components / processes are:
 
@@ -27,12 +27,12 @@ This markdown file uses the GBIF API to extract a variety of information and use
 3. Species DNA availability
 
   * Download data relating to the availability of DNA matches for each species and assay types
-  * Calculate a  per genus DNA catalogue value representing how well that genus is covered in online DNA databases
+  * Calculate a per genus DNA catalogue value representing how well that genus is covered in online DNA databases
   
   
 ## Important notes and considerations
 
- * This markdown file has been provided to enable thorough examination of our approach and processes, with a focus on GBIF. For day to day client use a singular .R script file will also be provided that does not contain the same level of commentary, exploration and visualisations.
+ * This markdown file has been provided to enable thorough examination of our approach and processes, with a focus on GBIF. For day to day client use, run the main.R script file in the root directory to execute all of the Rmd files in the project in the correct order.
  
  * Some components of this script require downloads that can take many hours. Where possible local caches of files are retained and scripts only download incremental updates, however care should be take to read instructions and skip code blocks that will result in unnecessary duplication of downloads.
  
@@ -42,17 +42,22 @@ This markdown file uses the GBIF API to extract a variety of information and use
     * GDAL, GEOS, PROJ, netcdf, sqlite3 and tbb as dependencies of the RSpatial library from CRAN (sudo apt-get install libgdal-dev gdal-bin libgeos-dev libproj-dev libtbb-dev libnetcdf-dev)
 
 
-# Load data and libraries
+# ETL PROCESS
+
+## Load data and libraries
 
 The problems in the data import all relate to column 22 ("neg_cont_type") which isn't used in our analysis but always good to check on import whether there were any issues.
 
 ```{r}
+library(curl)
 library(dplyr)
+library(fs)
 library(geosphere)
 library(ggplot2)
 library(httr)
 library(jsonlite)
 library(lwgeom)
+library(ncdf4)
 library(progress)
 library(progressr)
 library(purrr)
@@ -62,8 +67,11 @@ library(rnaturalearth)
 library(rnaturalearthdata)
 library(sf)
 library(stringr)
+library(terra)
 library(tibble)
 library(tidyr)
+library(tools)
+
 
 # Load in the full dataset
 data <- read_csv("../Data/all_voyages.csv")
@@ -74,17 +82,50 @@ problems(data)
 Next subset the data to only the columns we need and limit observations to ray-finned and cartilaginous fish as the client does not require information about other classes of animals such as birds and mammals.
 
 ```{r}
+# Drop columns that are all NA
+# data <- data[, sapply(data, function(x) !all(is.na(x))), drop = FALSE]
+
 keep_columns <- c("ASV","sample","assay_name","Assay","count",
-                  "class","order","family","genus","species","Species_In_LCA","X.ID",
+                  "class","order","family","genus","species","LCA", "Species_In_LCA","X.ID",
                   "ASV_sequence","decimalLongitude","decimalLatitude")
 data <- data[,keep_columns]
-str(data)
 
-# Filter dataframe to only include finned and cartilage fishes
+# Remove any leading and/or trailing whitespace and replace empty character variables with NA
+data[] <- lapply(data, function(x) {
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x == ""] <- NA
+  }
+  x
+})
+
+# Get a sense for the number of rows that aren't that useful for the task
+data %>%
+  summarise(
+    total_rows      = n(),
+    species_dropped = sum(tolower(species) == "dropped", na.rm = TRUE),
+    no_dna_match    = sum(is.na(LCA)),
+    not_fish        = sum(!is.na(class) & !str_detect(class, regex("Actinopterygii|Chondrichthyes", ignore_case = TRUE))),
+    valid_fish      = sum(tolower(species) != "dropped", na.rm = TRUE)
+  )
+
+# Filter dataframe to only include finned and cartilage fishes (not this also results in dropping the 310488 rows without any DNA match)
 data <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
+
 ```
 
-## Assay variables
+```{r}
+na_report <- data.frame(
+  column       = keep_columns,
+  n_missing    = colSums(is.na(data)),
+  pct_missing  = round(100 * colMeans(is.na(data)), 1)
+)
+na_report <- na_report[order(-na_report$n_missing), ]
+print(na_report, row.names = FALSE)
+
+```
+
+### Assay variables
 
 There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use as it does not contain any NA values.
 
@@ -104,8 +145,88 @@ data <- data %>% relocate(Assay_Length, .after = 4)
 
 str(data)
 ```
+### Species = "dropped"
 
-# Generate Species list and taxonKey for easier GBIF API access
+Need to update the explanation here. For now, dropping rows that don't have an exact species match. Once things are running smoothly I'm still keen to use the below code that splits out the potential species matches from the genus into invidual rows.
+
+```{r}
+# Flag to control how rows without an exact species match are treated
+Expand_Potential_Species = FALSE
+
+# Extract total row numbers, rows containing "dropped" as the species, and those that don't have any matches at all
+data %>% summarise(total_rows = n(), species_dropped = sum(grepl("dropped", species, ignore.case = TRUE)), no_dna_match = sum(grepl(NA, LCA)))
+
+# Drop rows that contain NA for LCA as we don't have a match on anything at all for these DNA samples
+data <- data %>% filter(!is.na(LCA))
+
+### IMPUTE ROWS FROM SPECIES_IN_LCA FUNCTION
+index_to_letters <- function(n) {
+  to_base26 <- function(x) {
+    s <- ""
+    while (x > 0) {
+      x <- x - 1
+      s <- paste0(LETTERS[x %% 26 + 1], s)
+      x <- x %/% 26
+    }
+    s
+  }
+  vapply(n, to_base26, character(1))
+}
+
+expand_imputed_species <- function(df) {
+  exact_species <- df %>%
+    filter(!is.na(species), species != "dropped") %>%
+    mutate(
+      Imputed = FALSE,
+      Match_Level = "Species",
+      original_sample = sample
+    )
+
+  templates <- df %>%
+    filter(is.na(species) | species == "dropped") %>%
+    group_by(ASV, sample) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+
+  expanded <- templates %>%
+    mutate(Species_In_LCA = na_if(Species_In_LCA, "")) %>%
+    filter(!is.na(Species_In_LCA)) %>%
+    mutate(candidates = str_split(Species_In_LCA, ",")) %>%
+    unnest(candidates) %>%
+    mutate(candidates = str_squish(candidates)) %>%
+    group_by(ASV, sample) %>%
+    mutate(
+      .idx            = row_number(),
+      .suffix         = index_to_letters(.idx),
+      original_sample = sample,                  # keep pre-suffix id
+      sample          = paste0(sample, "_IMPUTED", .suffix),
+      species         = candidates,
+      Imputed         = TRUE,
+      Match_Level     = "Genus"
+    ) %>%
+    ungroup() %>%
+    select(-c(candidates, .idx, .suffix))
+
+  bind_rows(exact_species, expanded) %>%
+    arrange(ASV, sample)
+}
+
+if (Expand_Potential_Species==FALSE) {
+  data <- data %>% filter(species!="dropped")
+} else {
+  # Expand rows with multiple potential species into individual rows
+  data <- expand_imputed_species(data)
+
+  # Extract total row numbers and rows that have been imputed from the "Species_In_LCA" column
+  data %>% summarise(total_rows = n(), imputed_rows = sum(grepl("True", Imputed, ignore.case = TRUE)))
+}
+
+str(data)
+```
+
+# GBIF API ACCESS
+
+Generate Species list and taxonKey for easier GBIF API access
 
 ## Function for processing data to extract unique species list
 
@@ -208,7 +329,6 @@ Note that this update is incremental. If GBIF_Taxonomy.csv already exists in the
 If GBIF_Taxonomy.csv does not exist then it will be generated and this process takes between 20 and 30 minutes depending on the number of unique species in the "data" dataframe.
 
 ```{r}
-
 # Run the script
 species_vec <- extract_unique_species(data, "Species_In_LCA")
 taxonomy <- resolve_species_backbone(
@@ -236,7 +356,9 @@ cat("Rows with non-EXACT matches: ", nrow(fuzzy), "\n")
 
 ```
 
-# Map sample locations for all species
+# PROCESS LOCATION DATA
+
+## Map sample locations for all species
 
 Polling the GBIF API for location based observations by species row by row quickly hits the API rate limit.
 Instead we create a bounding box for all the locations in the datafile and then bulk download the GBIF data for species observations within that bounding box.
@@ -253,16 +375,19 @@ Sys.setenv(GBIF_USER=gbif_u, GBIF_PWD=gbif_p, GBIF_EMAIL=gbif_e)
 
 
 ```{r}
-# Keep only rows with coordinates and a taxonKey
-work <- data %>%
-  filter(!is.na(taxonKey), !is.na(decimalLatitude), !is.na(decimalLongitude))
+# Drop any rows without a location
+data <- data %>% filter(!is.na(decimalLongitude))
+data <- data %>% filter(!is.na(decimalLatitude))
+
+# Keep only rows with a taxonKey
+work <- data %>% filter(!is.na(taxonKey))
 
 # Extract the list of taxonKeys from which to download location information
 taxa <- work$taxonKey %>% unique() %>% as.character()
 
 # Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
 # Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
-buffer_km <- 25
+buffer_km <- 50
 pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
 
 # Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
@@ -323,37 +448,30 @@ data_with_dist %>% select(species, decimalLatitude, decimalLongitude, distance_f
 
 ```
 
-The erroneous location has Lat/Lon in the middle of the Pacific Ocean, but the field "geo_loc_name" is Indian Ocean: Diamantina. A lat/lon of -32.1088, 110.266 would put these samples closer to the Diamantina but not exactly on it. We have decided to drop these rows from our analysis but the potential is there to change them to decimalLongitude 110.2667
+The erroneous location has the same Lat/Lon, where the Longitude is invalid. The field "geo_loc_name" is Indian Ocean: Diamantina. A lat/lon of -32.1088, 110.266 would put these samples closer to the Diamantina but not exactly on it. We have decided to correct these values assuming the 210 is a typo that should have been 110.
 
 ```{r}
 hist(data$decimalLongitude)
 
 # Filter rows where longitude > 200
-suss_longitudes <- data %>% filter(decimalLongitude > 200)
+suss_longitudes <- data %>% filter(decimalLongitude > 180)
 print(suss_longitudes)
 
-# Filter the original dataset to understand more about these locations
-data_lon200 <- read_csv("../Data/all_voyages.csv")
-data_lon200 <- data_lon200 %>% filter(decimalLongitude > 200)
-write_csv(data_lon200, "../Data/all_voyages_lon200.csv")
+# Update these rows to the assumed correct lattitude
+data$decimalLongitude[data$decimalLongitude > 180] <- 110.2667
 
-# Filter data to remove invalid Longitudes
-data <- data %>% filter(decimalLongitude < 200)
 ```
 
-### Refit our AOI with rows containing invalid location data removed
+### Refit our AOI now that the invalid data has been corrected
 
 ```{r}
-# Keep only rows with coordinates and a taxonKey
-work <- work %>% filter(decimalLongitude < 180)
-
 # Extract the list of taxonKeys from which to download location information
-taxa <- work$taxonKey %>% unique() %>% as.character()
+taxa <- data$taxonKey %>% unique() %>% as.character()
 
 # Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
 # Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
 buffer_km <- 50
-pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+pts_wgs84 <- st_as_sf(data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
 
 # Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
 pts_aea   <- st_transform(pts_wgs84, 3577)
@@ -406,7 +524,9 @@ print(gg)
 ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
 ```
 
-## Understand and scope the available GBIF location observation data
+## ---GBIF---
+
+### Understand and scope the available GBIF location observation data
 
 Early iterations of our code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). The code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
 
@@ -534,9 +654,9 @@ write_csv(gbif_joined, "../Data/GBIF_Taxonomy.csv")
 
 ```
 
-## Download species observation data
+### Download species observation data
 
-### Function to extract observation data from AOI by species
+#### Function to extract observation data from AOI by species
 
 ```{r}
 # Extract Taxon keys from GBIF_Taxonomy
@@ -701,7 +821,7 @@ if (length(files) > 0) {
 
 ```
 
-## Compare sample Lat/Lon to GBIF species observations
+### Compare sample Lat/Lon to GBIF species observations
 
 ```{r}
 # ---- Settings ---------------------------------------------------------------
@@ -768,13 +888,268 @@ data$nearest_obs_100km <- data$nearest_obs_m < 100000
 
 ```
 
+## ---AQUAMAPS---
+
+### Download Species Location Data
+
+Tool to download information from Aquamaps
+
 ```{r}
-str(data)
-summary(data)
+# Import list of species from Philipp's file
+tsvcolnames <- c("Species","DNA_Counts")
+species_list <- read_tsv("../Data/OceanGenomes.CuratedNT.NBDLTranche1and2and3.CuratedBOLD.species_counts.tsv", col_names=tsvcolnames)
+all_species <- species_list$Species
+all_species <- unique(all_species)
+
+# Merge with Philipp's list removing "dropped", NAs, trailing white space and duplicates
+all_species <- c(all_species, unique(data$species)) %>% trimws %>% unique() %>%   setdiff(c("", NA, "dropped"))
+
+# Create empty lists to hold the data
+urls        <- c()
+destfiles   <- c()
+
+# Download the AquaMaps data for each species to the "AquaMaps" folder in the "Data" folder
+for(i in all_species){
+    i        <- gsub(" ", "_", i)
+    url      <- paste0("https://thredds.d4science.org/thredds/fileServer/public/netcdf/AquaMaps_11_2019/", i, ".nc")
+    destfile <- paste0("../Data/AquaMaps/", i, ".nc")
+    destfile <- gsub(':', 'X', destfile )
+    if(! file.exists(paste0("../Data/AquaMaps/", i, ".nc")) ) {
+        urls      <- c(urls, url)
+        destfiles <- c(destfiles, destfile)
+    }
+}
+
+res       <- multi_download(urls, destfiles)
+delete_us <- res$destfile[res$status_code == "404"]
+file.remove(delete_us)
+```
+
+#### Inspect a single Aquamaps NC file to understand the NC format
+
+```{r}
+# Choose a single file (change name to one that exists in ../Data/AquaMaps/)
+file <- "../Data/AquaMaps/Diaphus_aliciae.nc"
+
+# Load as a raster
+r <- rast(file)
+
+# Inspect contents
+r
+
+#> class       : SpatRaster 
+#> dimensions  : 360, 720, 1  (nrow, ncol, nlyr)
+#> resolution  : 0.5, 0.5  (degrees)
+#> extent      : -180, 180, -90, 90
+#> coord. ref. : lon/lat WGS84 
+#> source(s)   : ../Data/AquaMaps/Thunnus_albacares.nc 
+#> name(s)     : Probability   (or similar)
+
+# Plot the location data
+plot(r, main="Predicted habitat probability")
+
+# Extract the probability for a species at a specific location
+sample_lat <- -28.67171667
+sample_lon <- 111.4407833
+value <- extract(r, cbind(sample_lon, sample_lat))
+print(value)
+
+```
+
+#### Identify corrupted / unopenable files and remove them
+
+About half the files downloaded aren't valid distribution data (not sure if this is due to a lack of a match to the species name or if AquaMaps simple doesn't have any data). This code block deletes these files.
+
+```{r}
+# PART A: AUDIT OF DOWNLOADED .NC FILES TO SEE WHAT'S BROKEN
+nc_dir <- "../Data/AquaMaps"
+nc_files <- dir_ls(nc_dir, glob = "*.nc")
+
+audit <- tibble(
+  file  = nc_files,
+  token = basename(nc_files),
+  size  = file_info(nc_files)$size
+) %>%
+  mutate(
+    is_zero = size == 0
+  )
+
+# Helper: detect file "signature" (NetCDF-3 vs HDF5 vs other)
+sig_kind <- function(path) {
+  con <- file(path, "rb"); on.exit(close(con), add = TRUE)
+  raw <- try(readBin(con, what = "raw", n = 8), silent = TRUE)
+  if (inherits(raw, "try-error") || length(raw) == 0) return("unreadable")
+  # NetCDF-3 starts with 'CDF'
+  if (length(raw) >= 3 && identical(raw[1:3], charToRaw("CDF"))) return("netcdf3")
+  # NetCDF-4/HDF5 starts with 0x89 0x48 0x44 0x46 i.e. \x89 H D F
+  if (length(raw) >= 4 && identical(raw[1:4], as.raw(c(0x89, 0x48, 0x44, 0x46)))) return("hdf5")
+  # Quick HTML sniff (sometimes a 404 page saved as .nc)
+  text <- suppressWarnings(rawToChar(raw[raw >= as.raw(0x20) & raw <= as.raw(0x7E)], multiple = TRUE))
+  if (length(text) && grepl("DOCTYPE|<html|HTTP", paste(text, collapse = ""), ignore.case = TRUE)) return("html")
+  "unknown"
+}
+
+audit$signature <- vapply(audit$file, sig_kind, character(1))
+
+# Try opening with ncdf4 as an independent check (GDAL vs NetCDF library)
+can_open_ncdf4 <- function(p) {
+  out <- try({
+    nc <- ncdf4::nc_open(p); on.exit(ncdf4::nc_close(nc), add = TRUE); TRUE
+  }, silent = TRUE)
+  isTRUE(out)
+}
+audit$ncdf4_ok <- vapply(audit$file, can_open_ncdf4, logical(1))
+
+# Summary of what's suspicious
+audit_summary <- audit %>%
+  count(signature, ncdf4_ok, is_zero, name = "n")
+print(audit_summary)
+
+# List the worst offenders (not netcdf & can't open)
+suspect <- audit %>%
+  filter(is_zero | signature %in% c("html", "unknown", "unreadable") | !ncdf4_ok)
+
+# Show which files will be removed
+print(suspect)
+
+# Delete the bad files so they can be re-downloaded cleanly
+bad_files <- suspect$file
+if (length(bad_files)) {
+  file.remove(bad_files)
+  cat("Deleted", length(bad_files), "corrupted or invalid files.\n")
+} else {
+  cat("No corrupted files found.\n")
+}
+
+```
+
+### Build a function that can loop through the entire dataset and apply a probability to the sample location from the AquaMaps .NC files
+
+```{r}
+# PART 1: DATA PREPARATION
+
+# Function to convert species name into matching .nc file structure (Sillago bassensis -> Sillago_bassensis.nc)
+tok <- function(x) {
+  x <- gsub(" ", "_", x)  # AquaMaps convention
+  x <- gsub(":", "X", x)  # filesystem-safe
+  x
+}
+
+# Identify rows with missing/blank/dropped species *before* filename mapping
+data <- data %>%
+  mutate(
+    # use decimalLatitude/decimalLongitude and make numeric helpers for terra::extract
+    lat = as.numeric(decimalLatitude),
+    lon = as.numeric(decimalLongitude),
+    species_trim = trimws(species),
+    has_species  = !is.na(species_trim) & species_trim != "" & species_trim != "dropped",
+    .token = ifelse(has_species, tok(species_trim), NA_character_),
+    .nc    = ifelse(!is.na(.token), file.path("../Data/AquaMaps", paste0(.token, ".nc")), NA_character_),
+    am_prob = NA_real_
+  )
+
+# Build .nc path per-row, create output column
+data <- data %>%
+  mutate(
+    # keep the same mapping (idempotent); columns are already created above
+    .token = .token,
+    .nc    = .nc,
+    am_prob = am_prob
+  )
+
+# Warn about any bad coordinates (still allowed; will return NA)
+bad_lat <- which(!is.na(data$lat) & (data$lat < -90 | data$lat > 90))
+bad_lon <- which(!is.na(data$lon) & (data$lon < -180 | data$lon > 180))
+if (length(bad_lat) || length(bad_lon)) {
+  warning(sprintf("Coords out-of-range: lat=%d, lon=%d", length(bad_lat), length(bad_lon)))
+}
+
+# PART 2: LOOP THROUGH DATAFILE, PROCESSING LOCATION PROBABILITIES FOR EACH SPECIES AND SAMPLES
+species_tokens <- unique(na.omit(data$.token))
+missing_rasters <- character()  # to log which species had no .nc file
+
+for (sp in species_tokens) {
+  idx <- which(data$.token == sp)
+  if (!length(idx)) next
+
+  ncfile <- data$.nc[idx[1]]
+  if (!file.exists(ncfile)) {
+    message("[skip] Missing raster for species token: ", sp)
+    missing_rasters <- c(missing_rasters, sp)
+    next
+  }
+
+  r <- try(rast(ncfile), silent = TRUE)
+  if (inherits(r, "try-error")) {
+    warning("[skip] Failed to open raster: ", ncfile)
+    next
+  }
+
+  # Use only rows with valid numeric coords in bounds
+  valid <- which(
+    !is.na(data$lon[idx]) & !is.na(data$lat[idx]) &
+    data$lon[idx] >= -180 & data$lon[idx] <= 180 &
+    data$lat[idx] >=  -90 & data$lat[idx] <=  90
+  )
+  if (!length(valid)) next  # nothing to extract for this species
+
+  idxv <- idx[valid]
+  pts  <- cbind(data$lon[idxv], data$lat[idxv])   # (lon, lat) order!
+
+  # Use Terra library to extract data from the .nc files
+  vals_df <- terra::extract(r, pts)               # some versions add an 'ID' column
+  if (is.data.frame(vals_df) && "ID" %in% names(vals_df)) {
+    vals_df <- vals_df[, setdiff(names(vals_df), "ID"), drop = FALSE]
+  }
+  vals <- if (is.data.frame(vals_df) && ncol(vals_df) >= 1) vals_df[[1]] else rep(NA_real_, length(idxv))
+
+  # Sanity check: do the lengths of number of species in our data and number of locations from the .nc files match
+  if (length(vals) != length(idxv)) {
+    stop(sprintf("Sanity failed for '%s': got %d values for %d rows.", sp, length(vals), length(idxv)))
+  }
+
+  # Assign back to those valid rows (invalid stay NA)
+  data$am_prob[idxv] <- vals
+}
+
+# PART 3: REPORT ON THE OVERALL PROCESSING
+cat("\nSummary of am_prob:\n")
+print(summary(data$am_prob))
+cat("Rows with NA am_prob:", sum(is.na(data$am_prob)), "\n")
+
+if (length(missing_rasters)) {
+  missing_rasters <- sort(unique(missing_rasters))
+  cat("Species tokens with missing .nc files (first 25 shown):\n")
+  print(head(missing_rasters, 25))
+}
+
+# Optional: which expected files have no match on disk (quick audit)
+tokens_expected <- unique(paste0(na.omit(data$.token), ".nc"))
+files_on_disk  <- list.files("../Data/AquaMaps", pattern = "\\.nc$", full.names = FALSE)
+not_found <- setdiff(tokens_expected, files_on_disk)
+cat("Unmatched tokens (no .nc on disk):", length(not_found), "\n")
+if (length(not_found)) print(head(not_found, 25))
+
+# Glance at results
+head(data[c("species", "decimalLatitude", "decimalLongitude", "am_prob")], 10)
+
+# Export datafile with location probabilities
+head(data)
+data <- data %>% select(-c(lat, lon, species_trim, .token))
+
+# Number of rows with / without location probability
+(sum(!is.na(data$am_prob)))
+(sum(is.na(data$am_prob)))
+
+# Number of rows with / without species name
+(sum(data$species != "dropped"))
+(sum(data$species == "dropped"))
 ```
 
 
-# eDNA Genus Completeness Calculations
+# PROCESS DNA RELATED DATA
+
+## ---eDNA GENUS COMPLETENESS---
 
 These CSVs are downloaded from https://shiny.cefe.cnrs.fr/GAPeDNA/ based on the following selections:
 
@@ -785,8 +1160,9 @@ These CSVs are downloaded from https://shiny.cefe.cnrs.fr/GAPeDNA/ based on the 
 
 Note: Client uses Berry_16S but that isn't an available filter. DiBattista appears to have the best coverage of the available primer pairs for 16S analysis so an assumption is made that this will provide sufficient estimation of comparable Berry_16S coverage.
 
-## Load data
-### Provide CSV inputs
+### Load data
+
+CSV inputs for each region for each of the 12S and 16S assay types needs to be loaded and processed
 
 ```{r}
 # Manually enter regions exactly as they appear in the filenames
@@ -819,7 +1195,7 @@ clean_name <- function(x) {
 
 ```
 
-### Process and join the CSV files
+#### Function to process and join the CSV files
 
 ```{r}
 
@@ -869,7 +1245,7 @@ head(merged_16S_coverage)
 
 ```
 
-### Validate rows
+#### Validate rows
 
 ```{r}
 check_conflicts <- function(merged_df) {
@@ -1022,7 +1398,7 @@ genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)
 
 ## Apply species DNA coverage value back to the original dataframe
 
-### Join to "data"
+### Join to main dataframe
 
 ```{r}
 # Create a new variable based on whether it's a 12 or 16 assay
@@ -1061,8 +1437,33 @@ data <- data %>%
 str(data)
 ```
 
-### Export out to CSV for use in other scripts
+## ---FISH TREE OF LIFE---
+
+### Add species diversification rates to dataframe
 
 ```{r}
-write_csv(data, "../Data/data_GBIF_enriched.csv")
+# Import tiprates.csv
+tiprates <- read_csv("../Data/tiprates.csv")
+
+# Rescale dr (diversification rate) to range 0–1
+rng <- range(tiprates$dr, na.rm = TRUE)
+tiprates <- tiprates %>%  mutate(dr_normalised = (dr - rng[1]) / diff(rng))
+
+
+# Join dr + dr_normalised into main data by species
+data <- data %>% left_join(tiprates %>% select(species, dr, dr_normalised), by = "species")
+
+# Quick check
+head(data[c("species", "dr", "dr_normalised")])
+
+# Histogram of values to understand their spread
+hist(tiprates$dr)
+hist(tiprates$dr_normalised)
+summary(tiprates$dr_normalised)
+```
+
+# EXPORT ENRICHED DATAFILE
+
+```{r}
+write_csv(data, "../Data/data_enriched.csv")
 ```
