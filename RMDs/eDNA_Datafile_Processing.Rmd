@@ -315,15 +315,22 @@ Generate Species list and taxonKey for easier GBIF API access
 
 # Generate a list of unique species from the "Species_In_LCA" column
 extract_unique_species <- function(df, col = "Species_In_LCA") {
-  if (!col %in% names(df)) stop(sprintf('Column "%s" not found.', col))
-  df[[col]] |>
-    str_split(",") |>
-    unlist(use.names = FALSE) |>
-    str_squish() |>
-    discard(~ .x == "" || is.na(.x)) |>
-    unique() |>
-    sort()
+  
+  # Pull and coerce to character scalars
+  x <- as.character(df[[col]])
+
+  # Drop NA/empty
+  x <- x[!is.na(x) & nzchar(x)]
+
+  # Split on commas, trim, drop empties again
+  parts <- unlist(strsplit(x, ",", fixed = TRUE), use.names = FALSE)
+  parts <- stringr::str_squish(as.character(parts))
+  parts <- parts[nzchar(parts)]
+
+  # Return unique sorted vector (use base to avoid masking)
+  sort(unique(parts))
 }
+
 
 # Obtain the species taxonKey from GBIF
 resolve_one <- function(name) {
@@ -2149,7 +2156,7 @@ data <- data %>% left_join(tiprates %>% select(species, dr), by = "species")
 data$dr_scaled <- rescale(data$dr, to = c(0, 1))
 
 # Rescale log(dr) (diversification rate) to range 0–1
-data$dr_logscaled <- rescale(log(data$dr), to = c(0, 1))
+data$dr_logscaled <- rescale(log(data$dr), to = c(0.00001, 1))
 
 # Histogram of values to understand their spread
 hist(data$dr)
@@ -2184,7 +2191,7 @@ data <- data %>%
 
 # Sum total number of observations
 data$total_obs = data$gbif_count_AOI.tax + data$obis_hits_AU
-data$total_obs_logscaled <- rescale(log(data$total_obs), to = c(0, 1))
+data$total_obs_logscaled <- rescale(log(data$total_obs), to = c(0.00001, 1))
 data$obs_score <- data$total_obs_logscaled * 0.025
 
 # Sum number of geographic evidence (ranges from 0 to 3 if GBIF, OBIS and AquaMaps all have data)
