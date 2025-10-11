@@ -31,8 +31,9 @@ Stan_counts_load <- function()
   
   code <- 
     "data{
-      int<lower=1> read_counts;
-      int<lower=1> num_in_area;
+      real<lower=0.1> read_counts;
+      real<lower=0.1> num_obis;
+      real<lower=0.1> num_gbif;
       real<lower=0,upper=1> p_id;
       real<lower=0,upper=1> diversity_rate;
     }
@@ -40,18 +41,21 @@ Stan_counts_load <- function()
     parameters{
       real<lower=0,upper=1> p_rd;
       real<lower=0,upper=1> a_rd;
-      real<lower=0,upper=1> p_ta;
+      real<lower=0,upper=1> p_obis;
+      real<lower=0,upper=1> p_gbif;
       real<lower=0,upper=1> k;
     }
 
 
     transformed parameters{
       real<lower=0,upper=1> RD;
-      real<lower=0,upper=1> NT;
+      real<lower=0,upper=1> NTo;
+      real<lower=0,upper=1> NTg;
       real<lower=0,upper=1> ID;
       
-      RD= 1 - pow( (1 - p_rd), (a_rd * read_counts) );
-      NT = 1 - pow( (1 - p_ta), num_in_area);
+      RD = 1 - pow( (1 - p_rd), (a_rd * read_counts) );
+      NTo = 1 - pow( (1 - p_obis), num_obis);
+      NTg = 1 - pow( (1 - p_gbif), num_gbif);
       ID = pow(p_id, 1-k*diversity_rate);
     }"
   

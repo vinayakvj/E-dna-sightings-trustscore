@@ -26,9 +26,13 @@ Load_Bugs <- function()
       p_rd ~ dunif(0, 1)
       a_rd ~ dunif(0, 1)
 
-      # Probability for number of species found in target area
-      NT <- 1 - pow( (1 - p_ta), num_in_area)
-      p_ta ~ dunif(0, 1)
+      # Probability for number of species found in target area (OBIS)
+      NTo <- 1 - pow( (1 - p_obis), num_obis)
+      p_obis ~ dunif(0, 1)
+      
+      # Probability for number of species found in target area (GBIF)
+      NTg <- 1 - pow( (1 - p_gbif), num_gbif)
+      p_gbif ~ dunif(0, 1)
       
       # Probability of species ID given diversity rate
       ID <- pow(p_id, 1-k*diversity_rate)

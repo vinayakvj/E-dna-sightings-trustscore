@@ -33,7 +33,7 @@ Beta_BUGS <- function(prob_array, confidence_int = 0.95, num_chains = 4, num_ite
               n.chains = num_chains, n.iter = num_iterations, n.burnin = num_burnin,
               parameters.to.save = c("alpha","beta"),
               model.file = "BUGS_beta.txt",
-              DIC = FALSE, codaPkg = TRUE)#,debug=T)
+              DIC = FALSE, codaPkg = TRUE)
   
   codaobj <- read.bugs(res, quiet=TRUE)
   dist <- as.data.frame(as.matrix(codaobj))
@@ -80,7 +80,7 @@ Beta_BUGS <- function(prob_array, confidence_int = 0.95, num_chains = 4, num_ite
 
 
 
-Counts_and_ID_BUGS <- function(percentage_id, diversity_rate, read_counts, num_in_area, num_chains = 4, num_iterations=11000, num_burnin=1000, 
+Counts_and_ID_BUGS <- function(percentage_id, diversity_rate, read_counts, num_obis, num_gbif, num_chains = 4, num_iterations=11000, num_burnin=1000, 
                                show_summary=F, plot_density=F, plot_trace=F, show_time=T)
 {
   
@@ -88,7 +88,8 @@ Counts_and_ID_BUGS <- function(percentage_id, diversity_rate, read_counts, num_i
     # percentage_id - percentage match from BLAST
     # diversity_rate - normalized diversification score between 0 and 1. 0 means species is not diverse, 1 means highly diverse, DNA constantly changing
     # read_counts - the number of counts for the DNA in the sample
-    # num_in_area - number of species in the general area
+    # num_obis - number of species in the general area (OBIS)
+    # num_gbif - number of species in the general area (GBIF)
     # num_chains - number of simulations to run at a time, 
     # num_iterations - number of iterations to use for OpenBUGS simulation. The default is 11000
     # num_burnin - number of iterations to discard at the start, to let simulation 'warm up' 
@@ -99,7 +100,7 @@ Counts_and_ID_BUGS <- function(percentage_id, diversity_rate, read_counts, num_i
     
   # RETURNS:
     # A data frame with expected values for percentage_id (incorporating diversity) with label "ID"
-    #  and probabilities associated with read_counts (RD) and num_in_area (NT)
+    #  and probabilities associated with read_counts (RD) and num_in_area (NTo from OBIS, NTg from GBIF)
   
   
   
@@ -107,18 +108,18 @@ Counts_and_ID_BUGS <- function(percentage_id, diversity_rate, read_counts, num_i
   
   
   start_time <- Sys.time() 
-  res <- bugs(data=list(read_counts = read_counts,num_in_area = num_in_area, 
+  res <- bugs(data=list(read_counts = read_counts, num_obis = num_obis, num_gbif = num_gbif, 
                         p_id = percentage_id,diversity_rate=diversity_rate ),
               inits = NULL, 
               n.chains = num_chains, n.iter = num_iterations, n.burnin = num_burnin,
-              parameters.to.save = c("RD","NT","ID"),
+              parameters.to.save = c("RD","NTo","NTg","ID"),
               model.file = "Bugs_ID_counts.txt",
-              DIC = FALSE, codaPkg = TRUE)#,debug=T)
+              DIC = FALSE, codaPkg = TRUE)
   
   codaobj <- read.bugs(res, quiet=TRUE)
   dist <- as.data.frame(as.matrix(codaobj))
-  df <- data.frame(mean(dist$ID),mean(dist$RD),mean(dist$NT))
-  names(df) <- c("ID","RD", "NT")
+  df <- data.frame(mean(dist$ID),mean(dist$RD),mean(dist$NTo),mean(dist$NTg))
+  names(df) <- c("ID","RD", "NTo","NTg")
   
   if (show_summary)
   {

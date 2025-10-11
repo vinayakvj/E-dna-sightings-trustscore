@@ -74,7 +74,7 @@ Beta_Stan <- function(prob_array, model, confidence_int = 0.95, show_summary=F, 
 
 
 
-Counts_and_ID_Stan <- function(percentage_id, diversity_rate, read_counts, num_in_area, model, 
+Counts_and_ID_Stan <- function(percentage_id, diversity_rate, read_counts, num_obis, num_gbif, model, 
                                show_summary=F, plot_density=F, plot_trace=F, show_time=T)
 {
   
@@ -103,31 +103,32 @@ Counts_and_ID_Stan <- function(percentage_id, diversity_rate, read_counts, num_i
   start_time <- Sys.time() 
   
   
-  data.in <- list(read_counts = read_counts,num_in_area = num_in_area, 
+  data.in <- list(read_counts = read_counts, num_obis = num_obis, num_gbif=num_gbif, 
                   p_id = percentage_id,diversity_rate=diversity_rate )
   model.fit <- sampling(model, data=data.in, refresh=0)
+  
   ID = mean(extract(model.fit,pars="ID")[[1]])
   RD = mean(extract(model.fit,pars="RD")[[1]])
-  NT = mean(extract(model.fit,pars="NT")[[1]])
+  NTg = mean(extract(model.fit,pars="NTg")[[1]])
+  NTo = mean(extract(model.fit,pars="NTo")[[1]])
   
-  
-  df <- data.frame(ID,RD,NT)
-  names(df) <- c("ID","RD", "NT")
+  df <- data.frame(ID,RD,NTo, NTg)
+  names(df) <- c("ID","RD", "NTo","NTg")
   
   if (show_summary)
   {
-    print(model.fit, pars=c("ID", "RD","NT"), digits=5)
+    print(model.fit, pars=c("ID", "RD","NTo","NTg"), digits=5)
     check_hmc_diagnostics(model.fit)
   }
   if (plot_density)
   {
     posterior <- as.array(model.fit)
-    mcmc_dens(posterior, pars=c("ID", "RD","NT"))
+    mcmc_dens(posterior, pars=c("ID", "RD","NTo","NTg"))
   }
   if(plot_trace)
   {
     posterior <- as.array(model.fit)
-    mcmc_trace(posterior, pars=c("ID", "RD","NT"))
+    mcmc_trace(posterior, pars=c("ID", "RD","NTo","NTg"))
   }
   if (show_time)
   {
