@@ -2153,10 +2153,10 @@ tiprates <- read_csv("../Data/tiprates.csv")
 data <- data %>% left_join(tiprates %>% select(species, dr), by = "species")
 
 # Rescale dr (diversification rate) to range 0–1
-data$dr_scaled <- rescale(data$dr, to = c(0, 1))
+data$dr_scaled <- scales::rescale(data$dr, to = c(0, 1))
 
 # Rescale log(dr) (diversification rate) to range 0–1
-data$dr_logscaled <- rescale(log(data$dr), to = c(0.00001, 1))
+data$dr_logscaled <- scales::rescale(log(data$dr), to = c(0.0, 1))
 
 # Histogram of values to understand their spread
 hist(data$dr)
@@ -2168,13 +2168,14 @@ hist(data$dr_logscaled)
 
 ```{r}
 ### ---Join GBIF species observation counts to main data
-# Validate multiple columns have identical data
-sum(GBIF_Taxonomy$gbif_count_AOI.obs == GBIF_Taxonomy$gbif_count_AOI.tax) == nrow(GBIF_Taxonomy)
+# Validate multiple columns have identical data (only needed if GBIF_Taxonomy has been corruped by multiple writes and column duplication)
+# sum(GBIF_Taxonomy$gbif_count_AOI.obs == GBIF_Taxonomy$gbif_count_AOI.tax) == nrow(GBIF_Taxonomy)
+str(GBIF_Taxonomy)
 
 # Join based on taxonKey column
 data <- data %>%
   left_join(
-    GBIF_Taxonomy %>% select(taxonKey, gbif_count_AOI.tax),
+    GBIF_Taxonomy %>% select(taxonKey, gbif_count_AOI),
     by = c("taxonKey")
   )
 
@@ -2190,8 +2191,8 @@ data <- data %>%
   )
 
 # Sum total number of observations
-data$total_obs = data$gbif_count_AOI.tax + data$obis_hits_AU
-data$total_obs_logscaled <- rescale(log(data$total_obs), to = c(0.00001, 1))
+data$total_obs = data$gbif_count_AOI + data$obis_hits_AU
+data$total_obs_logscaled <- scales::rescale(log(data$total_obs), to = c(0, 1))
 data$obs_score <- data$total_obs_logscaled * 0.025
 
 # Sum number of geographic evidence (ranges from 0 to 3 if GBIF, OBIS and AquaMaps all have data)
