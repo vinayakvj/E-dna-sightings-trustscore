@@ -2178,8 +2178,8 @@ data <- data %>% select(-contains("obis_hits_AU"), -contains("gbif_count_AOI"))
 
 
 gbif_candidates <- c("gbif_count_AOI", "gbif_count_AOI.tax")
-gbif_chosen <- inters_obsect(candidates, names(GBIF_Taxonomy))[1]
-if (is.na(chosen)) stop("Neither gbif_count_AOI nor gbif_count_AOI.tax exists.")
+gbif_chosen <- intersect(gbif_candidates, names(GBIF_Taxonomy))[1]
+if (is.na(gbif_chosen)) stop("Neither gbif_count_AOI nor gbif_count_AOI.tax exists.")
 
 data <- data %>%
   left_join(
@@ -2233,6 +2233,14 @@ data$geo_evidence_score <- pmax(nearest_GBIF, nearest_OBIS, am_score)
 data$dr_logscaled[data$dr_logscaled == -Inf] <- 0
 data$DNA_score <- data$Pct_GenusDNA_inDB_ANY - (data$dr_logscaled * 0.025)
 
+# If any -Inf values slipped through, set to 0
+data <- data %>% mutate(across(c(DNA_score, obs_score), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+
+# Clean DNA_score (force numeric, replace NA and non-numeric with 0)
+data <- data %>%
+  mutate(DNA_score = suppressWarnings(as.numeric(DNA_score)),
+         DNA_score = replace_na(DNA_score, 0))
+
 # Blunt score = geo_evidence_score + dna_score + bonus points based whether it's a rare/common species
 data$blunt_score = data$geo_evidence_score * data$DNA_score + data$obs_score
 hist(data$blunt_score)
@@ -2251,10 +2259,10 @@ species_cols <- c("class", "order", "family", "genus", "species", "taxonKey", "m
 BLAST_cols <-   c("X.ID", "ASV_sequence")
 geoloc_cols <-  c("decimalLongitude", "decimalLatitude", "am_prob", "nearest_obs_m", "nearest_obs_20km", "nearest_obs_50km", "nearest_obs_100km", "nearest_obis_m",                              "obis_within_20km", "obis_within_50km", "obis_within_100km", "count_geo_evidence")
 dna_cols <-     c("TotalSpecies", "Pct_GenusDNA_inDB", "Pct_GenusDNA_inDB_ANY", "YesCount_12S", "YesCount_16S", "ProportionYes_12S", "ProportionYes_16S", "dr", "dr_scaled", "dr_logscaled")
-obs_cols <-     c("gbif_count_AOI.tax", "obis_hits_AU", "total_obs", "total_obs_scaled", "total_obs_logscaled")
+obs_cols <-     c("gbif_count_AOI", "obis_hits_AU", "total_obs", "total_obs_scaled", "total_obs_logscaled")
 score_cols <-   c("geo_evidence_score", "DNA_score", "obs_score", "blunt_score")
 
-data <- data %>% select(
+data_final <- data %>% select(
   any_of(sample_cols),
   any_of(species_cols),
   any_of(BLAST_cols),
@@ -2266,7 +2274,6 @@ data <- data %>% select(
 
 # RENAME: old -> new, then apply
 rename_map <- c(
-  "gbif_count_AOI.tax" = "GBIF_count",
   "obis_hits_AU" = "OBIS_count",
   "nearest_obs_m" = "nearest_GBIF_m",
   "nearest_obs_20km"   = "GBIF_within_20km",
@@ -2274,10 +2281,10 @@ rename_map <- c(
   "nearest_obs_100km"   = "GBIF_within_100km"
 )
 
-data <- data %>%
+data_final <- data %>%
   rename(!!!setNames(names(rename_map), rename_map)[names(rename_map) %in% names(.)])
 
 head(data)
-write_csv(data, "../Data/data_enriched.csv")
+write_csv(data_final, "../Data/data_enriched.csv")
 ```
 
