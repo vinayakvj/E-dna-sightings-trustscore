@@ -6,7 +6,6 @@
 # Whether or not to use Stan for simulations. Else use OpenBUGS. Stan seems to be much faster in the long term
 use_stan = T
 
-
 if (use_stan) {
   library(rstan)
   library(bayesplot)
@@ -37,8 +36,8 @@ max_index = nrow(data)
 
 # The data set is quite large. If you want to run all rows, use start_index = 1 and end_index = max_index
 ####### choose index range ###################################################################
-start_index = 1
-end_index = 20
+start_index = 50003
+end_index = 50012
 use_random_indices = FALSE     # if TRUE, take a random sample instead of sequential rows
 ##############################################################################################
 
@@ -48,7 +47,7 @@ num_rows = end_index-start_index+1
 if(use_random_indices)
 {
   set.seed(300)
-  indices = sample(1:50000, num_rows, replace = FALSE)
+  indices = sample(1:50000, num_rows, replace = FALSE) #probably should be num_rows
   
 }else 
 {
@@ -70,6 +69,7 @@ for (j in start_index:end_index)
 {
   
   i = indices[j] # allows for use of random indices 
+  jj = j -start_index+1 # index starting from 1
   
   percentage_id = data$X.ID[i]/100
   diversity_rate = data$dr_scaled[i]
@@ -88,7 +88,7 @@ for (j in start_index:end_index)
   match_prob_array = c(percent_genus_in_db) # other probabilities (match probabilities)
 
   # Calculate the Bayesian probability
-  bayes_score[j,1:10] = Bayesian_score(percentage_id, diversity_rate, read_counts, gbif_count, obis_count,
+  bayes_score[jj,1:10] = Bayesian_score(percentage_id, diversity_rate, read_counts, gbif_count, obis_count,
                                    nearest_distance_gbif, nearest_distance_obis, distance_for_50_percent=50000,
                                    location_prob_array, match_prob_array, 
                                    confidence_int = 0.95, calculate_location_too = T, use_stan = use_stan, 
@@ -98,10 +98,10 @@ for (j in start_index:end_index)
   
   
   # save index for future reference
-  bayes_score[j,11] = i
+  bayes_score[jj,11] = i
   
   #Indicate progress:
-  cat("Completed:", j-start_index+1,"/",num_rows,"\r")
+  cat("Completed:", jj,"/",num_rows,"\r")
 }
 
 # write to uniquely named file based on current time
