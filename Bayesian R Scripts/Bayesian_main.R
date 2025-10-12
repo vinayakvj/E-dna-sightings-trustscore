@@ -1,9 +1,9 @@
-# This is the main script to run all the Bayesian code. The code from here can be copied into the main .R file we submit to the client. 
+# This is the main script to run all the Bayesian code. 
 # It calls the other R scripts needed to run the Bayesian Code, then exports a csv file
 
 
 
-# Whether or not to use Stan for simulations. Else use OpenBUGS
+# Whether or not to use Stan for simulations. Else use OpenBUGS. Stan seems to be much faster in the long term
 use_stan = T
 
 
@@ -28,24 +28,27 @@ if (use_stan) {
   stan_counts_model <- NULL
 }
 
-
 # Load source code for bayesian calculations
 source("Bayesian_score.R")
-
 
 data <- read.csv("data_enriched.csv")
 max_index = nrow(data)
 
-# choose indices to start from 
+
+# The data set is quite large. If you want to run all rows, use start_index = 1 and end_index = max_index
+####### choose index range ###################################################################
 start_index = 1
-end_index = 50000
+end_index = 20
+use_random_indices = FALSE     # if TRUE, take a random sample instead of sequential rows
+##############################################################################################
+
+
 num_rows = end_index-start_index+1
-use_random_indices = TRUE # take a random sample instead of sequential rows
 
 if(use_random_indices)
 {
   set.seed(300)
-  indices = sample(1:max_index, num_rows, replace = FALSE)
+  indices = sample(1:50000, num_rows, replace = FALSE)
   
 }else 
 {
@@ -55,9 +58,9 @@ if(use_random_indices)
 
 # initialize score array (faster than updating each time)
 bayes_score = data.frame(matrix(nrow=num_rows, ncol=11)) 
-names(bayes_score) <- c("Posterior Mean", "Lower Confidence Interval", "Upper Confidence Interval", 
-                        "Match Posterior Mean","Match Lower Confidence Interval","Match Upper Confidence Interval",
-                        "Location Posterior Mean","Location Lower Confidence Interval","Location Upper Confidence Interval",
+names(bayes_score) <- c("Combined Probability", "Lower Confidence Interval", "Upper Confidence Interval", 
+                        "DNA Match Probability","DNA Match Lower Confidence Interval","DNA Match Upper Confidence Interval",
+                        "Location Probability","Location Lower Confidence Interval","Location Upper Confidence Interval",
                         "Info","Row Index")
 
 start_time_outside <- Sys.time() 
@@ -72,17 +75,18 @@ for (j in start_index:end_index)
   diversity_rate = data$dr_scaled[i]
   read_counts = data$count[i]
   # Assuming GBIF_count and OBIS_count are for species in area, not worldwide
-  gbif_count = data$GBIF_count[i]
+  gbif_count = data$gbif_count_AOI[i]
   obis_count = data$OBIS_count[i]
   p_aquamaps = data$am_prob[i]
   nearest_distance_gbif = data$nearest_GBIF_m[i]
   nearest_distance_obis = data$nearest_obis_m[i]
+  percent_genus_in_db = data$Pct_GenusDNA_inDB[i]
+  
   
   # put probabilities in these arrays, not raw counts or distances
   location_prob_array = c(p_aquamaps) # location-based probabilities 
-  match_prob_array = c() # other probabilities (match probabilities)
- 
-  
+  match_prob_array = c(percent_genus_in_db) # other probabilities (match probabilities)
+
   # Calculate the Bayesian probability
   bayes_score[j,1:10] = Bayesian_score(percentage_id, diversity_rate, read_counts, gbif_count, obis_count,
                                    nearest_distance_gbif, nearest_distance_obis, distance_for_50_percent=50000,
@@ -95,15 +99,20 @@ for (j in start_index:end_index)
   
   # save index for future reference
   bayes_score[j,11] = i
+  
+  #Indicate progress:
+  cat("Completed:", j-start_index+1,"/",num_rows,"\r")
 }
 
 # write to uniquely named file based on current time
+time = Sys.time()
+print(paste("Completed:", time))
 
-time = gsub("-","_",Sys.time()) 
+time = gsub("-","_",time) 
 time = gsub(":","_",time)
 time = gsub(" ","@",time)
 time = gsub("[.][0-9]*","",time)
-file_name = paste("Bayes_data_",time,".csv",sep="")
+file_name = paste("Bayes_data_row_",start_index,"_to_",end_index,"_Date_time_",time,".csv",sep="")
 write.csv(data.frame(data[indices[start_index:end_index],], bayes_score),file_name , row.names = FALSE)
 print(paste("Wrote to file:",file_name))
 
