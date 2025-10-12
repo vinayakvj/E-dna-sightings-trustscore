@@ -2138,6 +2138,8 @@ data <- data %>%
   ) %>%
   relocate(Pct_GenusDNA_inDB, .after = 9)
 
+# Also take a max value across both
+data$Pct_GenusDNA_inDB_ANY <- pmax(data$ProportionYes_12S,data$ProportionYes_16S, na.rm=TRUE)
 str(data)
 ```
 
@@ -2168,15 +2170,22 @@ hist(data$dr_logscaled)
 
 ```{r}
 ### ---Join GBIF species observation counts to main data
-# Validate multiple columns have identical data (only needed if GBIF_Taxonomy has been corruped by multiple writes and column duplication)
+# Validate multiple columns have identical data (only needed if GBIF_Taxonomy has been corrupted by multiple writes and column duplication)
 # sum(GBIF_Taxonomy$gbif_count_AOI.obs == GBIF_Taxonomy$gbif_count_AOI.tax) == nrow(GBIF_Taxonomy)
-str(GBIF_Taxonomy)
+# Deal with potential issues with variable names
+# Drop any columns that have been duplicated due to running the Rmd multiple times
+data <- data %>% select(-contains("obis_hits_AU"), -contains("gbif_count_AOI"))
 
-# Join based on taxonKey column
+
+gbif_candidates <- c("gbif_count_AOI", "gbif_count_AOI.tax")
+gbif_chosen <- inters_obsect(candidates, names(GBIF_Taxonomy))[1]
+if (is.na(chosen)) stop("Neither gbif_count_AOI nor gbif_count_AOI.tax exists.")
+
 data <- data %>%
   left_join(
-    GBIF_Taxonomy %>% select(taxonKey, gbif_count_AOI),
-    by = c("taxonKey")
+    GBIF_Taxonomy %>%
+      select(taxonKey, gbif_count_AOI = all_of(gbif_chosen)),
+    by = "taxonKey"
   )
 
 ### ---Join OBIS species observation counts to main data
@@ -2193,6 +2202,7 @@ data <- data %>%
 # Sum total number of observations
 data$total_obs = data$gbif_count_AOI + data$obis_hits_AU
 data$total_obs_logscaled <- scales::rescale(log(data$total_obs), to = c(0, 1))
+data$total_obs_logscaled[data$total_obs_logscaled == -Inf] <- 0
 data$obs_score <- data$total_obs_logscaled * 0.025
 
 # Sum number of geographic evidence (ranges from 0 to 3 if GBIF, OBIS and AquaMaps all have data)
@@ -2220,9 +2230,10 @@ am_score <- ifelse(is.na(data$am_prob), 0, data$am_prob)
 data$geo_evidence_score <- pmax(nearest_GBIF, nearest_OBIS, am_score)
 
 # Calculate a DNA score which combines % of the genus with DNA in databases + with the diversification rate
-data$DNA_score <- data$Pct_GenusDNA_inDB - (data$dr_logscaled * 0.025)
+data$dr_logscaled[data$dr_logscaled == -Inf] <- 0
+data$DNA_score <- data$Pct_GenusDNA_inDB_ANY - (data$dr_logscaled * 0.025)
 
-# Blunt score = geo_evidence_score + dna_score + bonus points based on 10% of the obs_logscaled
+# Blunt score = geo_evidence_score + dna_score + bonus points based whether it's a rare/common species
 data$blunt_score = data$geo_evidence_score * data$DNA_score + data$obs_score
 hist(data$blunt_score)
 
@@ -2239,7 +2250,7 @@ sample_cols <-  c("ASV","sample","Assay", "Assay_Type", "count", "Assay_Length")
 species_cols <- c("class", "order", "family", "genus", "species", "taxonKey", "matchType")
 BLAST_cols <-   c("X.ID", "ASV_sequence")
 geoloc_cols <-  c("decimalLongitude", "decimalLatitude", "am_prob", "nearest_obs_m", "nearest_obs_20km", "nearest_obs_50km", "nearest_obs_100km", "nearest_obis_m",                              "obis_within_20km", "obis_within_50km", "obis_within_100km", "count_geo_evidence")
-dna_cols <-     c("TotalSpecies", "YesCount_12S", "YesCount_16S", "ProportionYes_12S", "ProportionYes_16S", "dr", "dr_scaled", "dr_logscaled")
+dna_cols <-     c("TotalSpecies", "Pct_GenusDNA_inDB", "Pct_GenusDNA_inDB_ANY", "YesCount_12S", "YesCount_16S", "ProportionYes_12S", "ProportionYes_16S", "dr", "dr_scaled", "dr_logscaled")
 obs_cols <-     c("gbif_count_AOI.tax", "obis_hits_AU", "total_obs", "total_obs_scaled", "total_obs_logscaled")
 score_cols <-   c("geo_evidence_score", "DNA_score", "obs_score", "blunt_score")
 
@@ -2266,6 +2277,7 @@ rename_map <- c(
 data <- data %>%
   rename(!!!setNames(names(rename_map), rename_map)[names(rename_map) %in% names(.)])
 
+head(data)
 write_csv(data, "../Data/data_enriched.csv")
 ```
 
