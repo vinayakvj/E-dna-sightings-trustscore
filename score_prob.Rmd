@@ -1,0 +1,186 @@
+---
+title: "Untitled"
+author: "Nitish Rungta (23939001)"
+date: "2025-09-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+if (!requireNamespace("data.table", quietly=TRUE)) install.packages("data.table")
+if (!requireNamespace("sf", quietly=TRUE))         install.packages("sf")
+if (!requireNamespace("httr2", quietly=TRUE))      install.packages("httr2")
+if (!requireNamespace("jsonlite", quietly=TRUE))   install.packages("jsonlite")
+library(data.table); library(sf); library(httr2); library(jsonlite)
+
+RADIUS_KM <- 200        # search radius around sample point
+TH_YES    <- 0.60       # threshold to call location "YES"
+GRID_DEG  <- 0.5      
+
+# paths
+IN_CSV  <- "C:/Users/nikki/Downloads/all_voyages.csv/all_voyages.csv"
+OUT_CSV <- "C:/Users/nikki/Desktop/loc_obis_only.csv"
+OBIS_CACHE <- "cache/obis_counts.csv"
+
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+nznum  <- function(x) suppressWarnings(as.numeric(x))
+map_count_to_score <- function(n) pmin(1, log10(pmax(n,0)+1)/4)
+
+
+circle_wkt <- function(lon, lat, radius_km = RADIUS_KM) {
+  pt  <- st_sfc(st_point(c(lon, lat)), crs = 4326)
+  buf <- st_transform(pt, 3857)
+  buf <- suppressWarnings(st_buffer(buf, radius_km * 1000))
+  buf <- st_transform(buf, 4326)
+  if (any(!st_is_valid(buf))) buf <- st_make_valid(buf)
+  st_as_text(buf)
+}
+
+if (!dir.exists(dirname(OBIS_CACHE))) dir.create(dirname(OBIS_CACHE), recursive = TRUE, showWarnings = FALSE)
+if (file.exists(OBIS_CACHE)) {
+  obis_cache <- data.table::fread(OBIS_CACHE)
+} else {
+  obis_cache <- data.table::data.table(species=character(), cell=character(), radius_km=integer(), total=integer())
+}
+
+debug_obis <- function(sp, lon, lat, radius_km = RADIUS_KM) {
+  sp <- trimws(sp)
+  if (is.na(sp) || sp=="" || is.na(lon) || is.na(lat)) return(list(total=NA, status="bad inputs"))
+  wkt <- circle_wkt(lon, lat, radius_km)
+  req <- request("https://api.obis.org/v3/occurrence") |>
+    req_user_agent("OceanOmics-eDNA/loc-check (student)") |>
+    req_url_query(limit = 0, scientificname = sp, geometry = wkt)
+  resp <- tryCatch(req_perform(req), error=function(e) e)
+  if (inherits(resp, "error")) return(list(total=NA, status=paste("HTTP error:", resp$message)))
+  body <- tryCatch(resp_body_json(resp), error=function(e) list())
+  list(total = body$total %||% body$size %||% NA_integer_, status = paste("HTTP", resp_status(resp)))
+}
+
+get_obis_count_near <- function(sp, lon0, lat0, radius_km = RADIUS_KM) {
+  sp   <- trimws(as.character(sp))
+  lon0 <- nznum(lon0); lat0 <- nznum(lat0)
+  if (is.na(sp) || sp=="" || is.na(lon0) || is.na(lat0)) return(NA_integer_)
+
+  cell_key <- paste(round(lat0/GRID_DEG)*GRID_DEG, round(lon0/GRID_DEG)*GRID_DEG, sep = "_")
+
+  if (nrow(obis_cache)) {
+    hit <- obis_cache[(obis_cache$species == sp) & (obis_cache$cell == cell_key) & (obis_cache$radius_km == radius_km)]
+    if (nrow(hit)) return(hit$total[1])
+  }
+
+  wkt <- circle_wkt(lon0, lat0, radius_km)
+  req <- request("https://api.obis.org/v3/occurrence") |>
+    req_user_agent("OceanOmics-eDNA/loc-check (student)") |>
+    req_url_query(limit = 0, scientificname = sp, geometry = wkt)
+
+  total <- NA_integer_; ok <- FALSE
+  for (i in 1:3) {
+    resp <- tryCatch(req_perform(req), error=function(e) e)
+    if (!inherits(resp, "error") && resp_status(resp) == 200) {
+      body  <- tryCatch(resp_body_json(resp), error=function(e) list())
+      total <- (body$total %||% body$size %||% 0L)
+      ok <- TRUE
+      break
+    }
+    Sys.sleep(0.7 * i)  
+  }
+  if (!ok) total <- 0L
+
+  obis_cache <<- unique(rbind(
+    obis_cache,
+    data.table::data.table(species = sp, cell = cell_key, radius_km = radius_km, total = total),
+    fill = TRUE
+  ))
+  data.table::fwrite(obis_cache, OBIS_CACHE)
+
+  total
+}
+
+add_obis_location <- function(dt, col_sp="species", col_lat="decimalLatitude", col_lon="decimalLongitude") {
+  stopifnot(col_sp %in% names(dt), col_lat %in% names(dt), col_lon %in% names(dt))
+  s  <- as.character(dt[[col_sp]])
+  la <- nznum(dt[[col_lat]])
+  lo <- nznum(dt[[col_lon]])
+
+
+  bad <- which(is.na(s) | s=="" | tolower(s)=="dropped")
+  if (length(bad)) s[bad] <- NA
+
+  counts <- mapply(get_obis_count_near, s, lo, la, MoreArgs = list(radius_km = RADIUS_KM))
+  score  <- map_count_to_score(counts)
+  yn     <- ifelse(is.na(score), NA_character_, ifelse(score >= TH_YES, "Y", "N"))
+
+  dt[, `:=`(loc_obis_count = counts,
+            loc_obis       = score,
+            loc_obis_yes   = yn)]
+  dt
+}
+
+dt <- data.table::fread(IN_CSV)
+
+# dt <- add_obis_location(dt, col_sp="scientificName", col_lat="lat", col_lon="lon")
+dt <- add_obis_location(dt, col_sp="species", col_lat="decimalLatitude", col_lon="decimalLongitude")
+
+
+data.table::fwrite(
+  dt[, .(species = get("species"),
+         decimalLatitude = get("decimalLatitude"),
+         decimalLongitude = get("decimalLongitude"),
+         loc_obis_count, loc_obis, loc_obis_yes)],
+  OUT_CSV
+)
+
+print(summary(dt$loc_obis))
+print(head(dt[, .(species, decimalLatitude, decimalLongitude, loc_obis_count, loc_obis, loc_obis_yes)], 10))
+cat("Wrote:", OUT_CSV, "\n")
+
+
+
+```
+
+```{r}
+# ==== paths ====
+IN_CSV  <- "C:/Users/nikki/Desktop/.csv"
+OUT_DIR <- dirname(IN_CSV)                              
+
+# ==== load ====
+df <- read.csv(IN_CSV, check.names = FALSE)
+
+# ensure needed columns exist
+needed <- c("p_reliability","label","id_like","p_prior","decimalLongitude","decimalLatitude")
+missing <- setdiff(needed, names(df))
+if (length(missing)) stop(paste("Missing columns in CSV:", paste(missing, collapse=", ")))
+
+# helper: make a clean filename
+png_out <- function(name) file.path(OUT_DIR, name)
+
+
+```
+
+```{r}
+png(png_out("viz1_hist_p_reliability.png"), width=1000, height=650)
+par(mar=c(4.5,4.5,3,1))
+hist(df$p_reliability, breaks=40, col="gray85", border="white",
+     main="Posterior Reliability (p_reliability)", xlab="Probability a sighting is real (0–1)")
+abline(v=c(0.30,0.50,0.80), col=c("tomato","orange","forestgreen"), lwd=3, lty=2)
+legend("topleft", bty="n",
+       legend=c("Review 0.30","Plausible 0.50","Validated 0.80"),
+       col=c("tomato","orange","forestgreen"), lty=2, lwd=3)
+dev.off()
+
+
+```
+
+
+
+
+
+```{r}
+
+
+
+```
