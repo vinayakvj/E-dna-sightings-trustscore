@@ -1,0 +1,95 @@
+---
+title: "eDNA Analysis"
+author: "Nathan Reed (24110024)"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Explore the dataset to understand what level of coverage we have for our data sources
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+data2 <- read_csv("../Data/data_enriched.csv")
+
+# If any -inf values have slipped through change them to 0
+data2 <- data2 %>% mutate(across(c("DNA_score","obs_score"), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+```
+
+
+## Explore the scores to understand how the underlying data is influencing things
+
+Using the current formula, we have peaks for the blunt_score at 1 and 0, which is good (I think). It means for a large proporation of the samples we're strongly confident that it's right or wrong.
+
+I was hoping in the second plot that there would be a stronger relationship between our blunt_score and the X.ID but there isn't
+
+```{r cars}
+hist(data2$blunt_score, breaks=20)
+plot(data2$X.ID,data2$blunt_score)
+```
+
+```{r}
+hist(data2$geo_evidence_score, breaks=5)
+```
+
+```{r}
+# The proportion of times each data source is used to determine location validity
+
+# Max probability from the 3 different observation scores # <20k=1, <50k=0.99, <100k=0.90 
+nz <- function(x) ifelse(is.na(x), FALSE, x) 
+nearest_GBIF <- pmax( 
+  ifelse(nz(data2$GBIF_within_20km), 1.00, 0), 
+  ifelse(nz(data2$GBIF_within_50km), 0.99, 0), 
+  ifelse(nz(data2$GBIF_within_100km), 0.90, 0) ) 
+
+nearest_OBIS <- pmax( 
+  ifelse(nz(data2$obis_within_20km), 1.00, 0), 
+  ifelse(nz(data2$obis_within_50km), 0.99, 0), 
+  ifelse(nz(data2$obis_within_100km), 0.90, 0) ) 
+
+am_score <- ifelse(is.na(data2$am_prob), 0, data2$am_prob)
+
+# Build matrix in the order: Aquamaps (am_score, GBIS, OBIS)
+wmat <- cbind(am_score, nearest_GBIF, nearest_OBIS)
+wmat[!is.finite(wmat)] <- -Inf
+labels <- c("Aquamaps", "GBIF", "OBIS")
+
+# Row-wise max and tie logic
+maxv <- apply(wmat, 1, max)
+tol  <- 1e-9
+is_at_max <- abs(wmat - maxv) <= tol
+n_at_max  <- rowSums(is_at_max & is.finite(wmat))
+
+has_positive <- is.finite(maxv) & (maxv > 0)  # at least one positive signal
+
+# Classes
+is_winner   <- has_positive & (n_at_max == 1)
+is_two_src  <- has_positive & (n_at_max == 2)
+is_three_src<- has_positive & (n_at_max == 3)
+is_none     <- !has_positive
+
+# Winner labels for single-max rows
+idx <- max.col(wmat, ties.method = "last")   # ties will be excluded below
+winner <- factor(labels[idx], levels = labels)
+winner[!is_winner] <- NA
+
+# Counts
+tab_winners <- table(winner, useNA = "no")
+two_count   <- sum(is_two_src)
+three_count <- sum(is_three_src)
+none_count  <- sum(is_none)
+
+# Compose counts: 3 winners + 2 sources + 3 sources + None
+counts <- c(Aquamaps = 0L, GBIF = 0L, OBIS = 0L, `2 sources` = two_count, `3 sources` = three_count, None = none_count)
+counts[names(tab_winners)] <- as.integer(tab_winners)
+
+# Plot
+barplot(counts, main = "Use of data sources for validation sample location", ylab = "Count", xlab = "Data sources")
+
+```
+
+

@@ -1,0 +1,2290 @@
+---
+title: "GBIF Data Extraction"
+author: "Nathan Reed (24110024)"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# INTRODUCTION
+
+This markdown file uses the GBIF API to extract a variety of information and uses it to enrich our original dataset. The main components / processes are:
+
+1. Data processing / preparation
+
+  * Cleanup and structure the data
+  * Generate a unique species list and matching taxonKey to enable efficient calls to the GBIF API
+
+2. Location calculations
+
+  * Create an "Area of Interest" (AOI) mapped to the locations of all eDNA samples
+  * Download species observation data from GBIF from within the AOI
+  * Measure the distance between an eDNA sample and the nearest recorded observation of that species
+
+3. Species DNA availability
+
+  * Download data relating to the availability of DNA matches for each species and assay types
+  * Calculate a per genus DNA catalogue value representing how well that genus is covered in online DNA databases
+  
+  
+## Important notes and considerations
+
+ * This markdown file has been provided to enable thorough examination of our approach and processes, with a focus on GBIF. For day to day client use, run the main.R script file in the root directory to execute all of the Rmd files in the project in the correct order.
+ 
+ * Some components of this script require downloads that can take many hours. Where possible local caches of files are retained and scripts only download incremental updates, however care should be take to read instructions and skip code blocks that will result in unnecessary duplication of downloads.
+ 
+ * Some libraries may require additional OS installs. i.e. Ubuntu 24.04 LTS requires:
+
+    * libudunits2 as a dependency of the SF library from Cran (sudo apt install libudunits2-dev) 
+    * GDAL, GEOS, PROJ, netcdf, sqlite3 and tbb as dependencies of the RSpatial library from CRAN (sudo apt-get install libgdal-dev gdal-bin libgeos-dev libproj-dev libtbb-dev libnetcdf-dev)
+
+
+# ETL PROCESS
+
+## Load data and libraries
+
+The problems in the data import all relate to column 22 ("neg_cont_type") which isn't used in our analysis but always good to check on import whether there were any issues.
+
+```{r}
+library(arrow)
+library(curl)
+library(dplyr)
+library(fs)
+library(geosphere)
+library(ggplot2)
+library(httr)
+library(jsonlite)
+library(lwgeom)
+library(ncdf4)
+library(progress)
+library(progressr)
+library(purrr)
+library(readr)
+library(rgbif)
+library(rlang)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(scales)
+library(sf)
+library(stringr)
+library(terra)
+library(tibble)
+library(tidyr)
+library(tools)
+
+
+# Load in the full dataset
+data <- read_csv("../Data/all_voyages.csv")
+problems(data)
+```
+
+## Cleanup and structure the data
+Next subset the data to only the columns we need and limit observations to ray-finned and cartilaginous fish as the client does not require information about other classes of animals such as birds and mammals.
+
+```{r}
+# Drop columns that are all NA
+# data <- data[, sapply(data, function(x) !all(is.na(x))), drop = FALSE]
+
+keep_columns <- c("ASV","sample","assay_name","Assay","count",
+                  "class","order","family","genus","species","LCA", "Species_In_LCA","X.ID",
+                  "ASV_sequence","decimalLongitude","decimalLatitude")
+data <- data[,keep_columns]
+
+# Remove any leading and/or trailing whitespace and replace empty character variables with NA
+data[] <- lapply(data, function(x) {
+  if (is.character(x)) {
+    x <- trimws(x)
+    x[x == ""] <- NA
+  }
+  x
+})
+
+# Get a sense for the number of rows that aren't that useful for the task
+data %>%
+  summarise(
+    total_rows      = n(),
+    species_dropped = sum(tolower(species) == "dropped", na.rm = TRUE),
+    no_dna_match    = sum(is.na(LCA)),
+    not_fish        = sum(!is.na(class) & !str_detect(class, regex("Actinopterygii|Chondrichthyes", ignore_case = TRUE))),
+    valid_fish      = sum(tolower(species) != "dropped", na.rm = TRUE)
+  )
+
+# Filter dataframe to only include finned and cartilage fishes (not this also results in dropping the 310488 rows without any DNA match)
+data <- data %>% filter(class %in% c("Actinopterygii", "Chondrichthyes"))
+
+```
+
+```{r}
+na_report <- data.frame(
+  column       = keep_columns,
+  n_missing    = colSums(is.na(data)),
+  pct_missing  = round(100 * colMeans(is.na(data)), 1)
+)
+na_report <- na_report[order(-na_report$n_missing), ]
+print(na_report, row.names = FALSE)
+
+```
+
+### Assay variables
+
+There's both "Assay" and "assay_name" in the supplied file. Looks like "Assay" is the better one to use as it does not contain any NA values.
+
+```{r}
+table(data$Assay, useNA="always")
+table(data$assay_name, useNA="always")
+
+# Drop "assay_name" from the data
+data <- select(data, -assay_name)
+
+# Create a new variable which is the string length of the ASV sequence
+data$Assay_Length <- nchar(data$ASV_sequence)
+
+# Re-order columns so related data is next to each other
+data <- data %>% relocate(Assay, .after = 3)
+data <- data %>% relocate(Assay_Length, .after = 4)
+
+str(data)
+```
+### Species = "dropped"
+
+Need to update the explanation here. For now, dropping rows that don't have an exact species match. Once things are running smoothly I'm still keen to use the below code that splits out the potential species matches from the genus into invidual rows.
+
+```{r}
+# Flag to control how rows without an exact species match are treated
+Expand_Potential_Species = FALSE
+
+# Extract total row numbers, rows containing "dropped" as the species, and those that don't have any matches at all
+data %>% summarise(total_rows = n(), species_dropped = sum(grepl("dropped", species, ignore.case = TRUE)), no_dna_match = sum(grepl(NA, LCA)))
+
+# Drop rows that contain NA for LCA as we don't have a match on anything at all for these DNA samples
+data <- data %>% filter(!is.na(LCA))
+
+### IMPUTE ROWS FROM SPECIES_IN_LCA FUNCTION
+index_to_letters <- function(n) {
+  to_base26 <- function(x) {
+    s <- ""
+    while (x > 0) {
+      x <- x - 1
+      s <- paste0(LETTERS[x %% 26 + 1], s)
+      x <- x %/% 26
+    }
+    s
+  }
+  vapply(n, to_base26, character(1))
+}
+
+expand_imputed_species <- function(df) {
+  exact_species <- df %>%
+    filter(!is.na(species), species != "dropped") %>%
+    mutate(
+      Imputed = FALSE,
+      Match_Level = "Species",
+      original_sample = sample
+    )
+
+  templates <- df %>%
+    filter(is.na(species) | species == "dropped") %>%
+    group_by(ASV, sample) %>%
+    slice_head(n = 1) %>%
+    ungroup()
+
+  expanded <- templates %>%
+    mutate(Species_In_LCA = na_if(Species_In_LCA, "")) %>%
+    filter(!is.na(Species_In_LCA)) %>%
+    mutate(candidates = str_split(Species_In_LCA, ",")) %>%
+    unnest(candidates) %>%
+    mutate(candidates = str_squish(candidates)) %>%
+    group_by(ASV, sample) %>%
+    mutate(
+      .idx            = row_number(),
+      .suffix         = index_to_letters(.idx),
+      original_sample = sample,                  # keep pre-suffix id
+      sample          = paste0(sample, "_IMPUTED", .suffix),
+      species         = candidates,
+      Imputed         = TRUE,
+      Match_Level     = "Genus"
+    ) %>%
+    ungroup() %>%
+    select(-c(candidates, .idx, .suffix))
+
+  bind_rows(exact_species, expanded) %>%
+    arrange(ASV, sample)
+}
+
+if (Expand_Potential_Species==FALSE) {
+  data <- data %>% filter(species!="dropped")
+} else {
+  # Expand rows with multiple potential species into individual rows
+  data <- expand_imputed_species(data)
+
+  # Extract total row numbers and rows that have been imputed from the "Species_In_LCA" column
+  data %>% summarise(total_rows = n(), imputed_rows = sum(grepl("True", Imputed, ignore.case = TRUE)))
+}
+
+str(data)
+```
+After encountering issues with joins, later in the project, we realised that our assumption that ASV + sample is unique and can be used as a surrogate key is wrong. Further investigation made us realised that the surrogate for joining data must be ASV + sample + Assay
+
+```{r}
+# Check whether we can use ASV + sample as a unique key
+nrow(dplyr::distinct(data, ASV, sample))
+nrow(data)
+
+# Inspect duplicates for a key
+analyze_dups <- function(df, key = c("ASV","sample")) {
+  # all rows where key is not unique
+  dup_all <- df %>%
+    group_by(across(all_of(key))) %>%
+    filter(n() > 1) %>%
+    ungroup()
+
+  # per-key summary: how many rows and how many distinct FULL rows
+  dup_summary <- dup_all %>%
+    group_by(across(all_of(key))) %>%
+    summarise(
+      n_rows = n(),
+      n_unique_rows = n_distinct(across(everything())),
+      .groups = "drop"
+    ) %>%
+    mutate(category = if_else(n_unique_rows == 1, "exact_duplicate", "conflicting_rows"))
+
+  # exact duplicates (every column equal within the group)
+  exact_dups <- dup_all %>%
+    semi_join(dup_summary %>% filter(category == "exact_duplicate"), by = key)
+
+  # conflicting rows (same key, but at least one column differs)
+  conflicts <- dup_all %>%
+    semi_join(dup_summary %>% filter(category == "conflicting_rows"), by = key)
+
+  # for conflicting groups, list the columns that vary
+  conflict_diffcols <- conflicts %>%
+    group_by(across(all_of(key))) %>%
+    summarise(
+      across(everything(), ~ n_distinct(.x, na.rm = FALSE)),
+      .groups = "drop"
+    ) %>%
+    pivot_longer(
+      -all_of(key),
+      names_to = "column",
+      values_to = "n_distinct_values"
+    ) %>%
+    filter(n_distinct_values > 1) %>%
+    arrange(across(all_of(key)), column)
+
+  list(
+    summary = dup_summary,
+    exact_dups = exact_dups,                 # all duplicate rows for keys that are exact duplicates
+    exact_dups_unique = exact_dups %>% distinct(),  # one representative row per exact-dup set
+    conflicts = conflicts,                   # the raw conflicting rows
+    conflict_diffcols = conflict_diffcols    # which columns differ per key
+  )
+}
+
+# --- usage on your main data frame ---
+res <- analyze_dups(data, key = c("ASV","sample"))
+
+# At-a-glance:
+res$summary
+# View which columns differ (for conflicting keys):
+res$conflict_diffcols %>% group_by(ASV, sample) %>% summarise(diff_cols = toString(column), .groups="drop")
+
+# Optional: inspect the first conflicting key’s rows:
+if (nrow(res$conflicts)) {
+  first_key <- res$conflicts %>% slice(100) %>% select(ASV, sample) %>% distinct()
+  print(first_key)
+  print(inner_join(first_key, res$conflicts, by = c("ASV","sample")))
+}
+
+# Check whether we can use ASV + sample + Assay as a unique key
+nrow(dplyr::distinct(data, ASV, sample, Assay))
+nrow(data)
+```
+
+# GBIF API ACCESS
+
+Generate Species list and taxonKey for easier GBIF API access
+
+## Function for processing data to extract unique species list
+
+```{r}
+# Function to deal with any empty fields returned by the API
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# Generate a list of unique species from the "Species_In_LCA" column
+extract_unique_species <- function(df, col = "Species_In_LCA") {
+  
+  # Pull and coerce to character scalars
+  x <- as.character(df[[col]])
+
+  # Drop NA/empty
+  x <- x[!is.na(x) & nzchar(x)]
+
+  # Split on commas, trim, drop empties again
+  parts <- unlist(strsplit(x, ",", fixed = TRUE), use.names = FALSE)
+  parts <- stringr::str_squish(as.character(parts))
+  parts <- parts[nzchar(parts)]
+
+  # Return unique sorted vector (use base to avoid masking)
+  sort(unique(parts))
+}
+
+
+# Obtain the species taxonKey from GBIF
+resolve_one <- function(name) {
+  res <- tryCatch(
+    name_backbone(name = name, rank = "species"),
+    error = function(e) list()
+  )
+  tibble(
+    species_input = name,
+    taxonKey      = res[["usageKey"]]       %||% NA_integer_,
+    matchedName   = res[["scientificName"]] %||% NA_character_,
+    matchType     = res[["matchType"]]      %||% NA_character_,
+    matchRank     = res[["rank"]]           %||% NA_character_
+  )
+}
+
+# Process all species and export to GBIF_Taxonomy.csv
+resolve_species_backbone <- function(species_vec,
+                                     out_csv = "../Data/GBIF_Taxonomy.csv",
+                                     overwrite = FALSE,
+                                     polite_pause = 0) {
+  species_vec <- unique(str_squish(as.character(species_vec)))
+  species_vec <- species_vec[species_vec != "" & !is.na(species_vec)]
+
+  # Read existing lean file (if any) and normalize old schemas on the fly
+  existing <- if (file.exists(out_csv) && !overwrite) read_csv(out_csv, show_col_types = FALSE) else NULL
+  if (!is.null(existing)) {
+    # keep only the lean columns if an older, wider file is present
+    wanted <- c("species_input","taxonKey","matchedName","matchType","matchRank")
+    missing <- setdiff(wanted, names(existing))
+    if (length(missing)) {
+      # try to fill matchRank from 'rank' if present (older schema)
+      if ("rank" %in% names(existing) && "matchRank" %in% missing) existing <- rename(existing, matchRank = rank)
+      # drop extras, keep available lean cols
+      existing <- existing %>% select(any_of(wanted))
+    }
+  }
+
+  to_resolve <- setdiff(species_vec, existing$species_input %||% character())
+
+  if (length(to_resolve) == 0 && !is.null(existing)) {
+    message("No new species to resolve. Using existing reference: ", out_csv)
+    final <- existing %>%
+      filter(species_input %in% species_vec) %>%
+      distinct(species_input, .keep_all = TRUE) %>%
+      arrange(species_input)
+    write_csv(final, out_csv)
+    return(final)
+  }
+
+  pb <- progress::progress_bar$new(
+    total = length(to_resolve),
+    format = "Resolving [:bar] :current/:total (:percent) ETA: :eta",
+    clear = FALSE, width = 70
+  )
+
+  new_rows <- map_dfr(to_resolve, function(nm) {
+    out <- resolve_one(nm)
+    pb$tick()
+    if (polite_pause > 0) Sys.sleep(polite_pause)
+    out
+  })
+
+# Important to filter only those where there is a species or genus match else it causes data download explosion later if it steps up to family level
+  final <- bind_rows(existing %||% tibble(), new_rows) %>%
+    filter(species_input %in% species_vec) %>%
+    distinct(species_input, .keep_all = TRUE) %>%
+    arrange(species_input) %>%
+    filter(matchRank %in% c("SPECIES", "GENUS")) 
+
+  write_csv(final, out_csv)
+  message("Wrote taxonomy reference: ", normalizePath(out_csv))
+  final
+}
+
+```
+
+## Run the script and then join to main dataframe
+
+Note that this update is incremental. If GBIF_Taxonomy.csv already exists in the "../Data/" directory then it will only add new species that are listed in the local "data" dataframe but not currently in "../Data/GBIF_Taxonomy.csv".
+
+If GBIF_Taxonomy.csv does not exist then it will be generated and this process takes between 20 and 30 minutes depending on the number of unique species in the "data" dataframe.
+
+```{r}
+# Run the script
+species_vec <- extract_unique_species(data, "Species_In_LCA")
+taxonomy <- resolve_species_backbone(
+  species_vec,
+  out_csv = "../Data/GBIF_Taxonomy.csv",
+  overwrite = FALSE,
+  polite_pause = 0
+)
+
+# Join data$species to taxonomy$species_input
+data <- data %>%
+  left_join(
+    taxonomy %>% select(species_input, taxonKey, matchType),
+    by = c("species" = "species_input")
+  )
+
+# QA summaries for data matching
+unmatched <- data %>% filter(is.na(taxonKey))
+fuzzy     <- data %>% filter(!is.na(taxonKey), matchType != "EXACT")
+
+cat("Total rows: ", nrow(data), "\n")
+cat("Rows with a taxonKey: ", nrow(data) - nrow(unmatched), "\n")
+cat("Rows without a taxonKey: ", nrow(unmatched), "\n")
+cat("Rows with non-EXACT matches: ", nrow(fuzzy), "\n")
+
+```
+
+# PROCESS LOCATION DATA
+
+## Map sample locations for all species
+
+Polling the GBIF API for location based observations by species row by row quickly hits the API rate limit.
+Instead we create a bounding box for all the locations in the datafile and then bulk download the GBIF data for species observations within that bounding box.
+Note that this requires a download through a validated account. Login credentials are stored in the "gbif.creds" file in the code folder.
+
+```{r}
+gbif_creds <- read.csv("gbif.creds", header=FALSE)
+gbif_u <- gbif_creds[1,2]
+gbif_p <- gbif_creds[3,2]
+gbif_e <- gbif_creds[2,2]
+
+Sys.setenv(GBIF_USER=gbif_u, GBIF_PWD=gbif_p, GBIF_EMAIL=gbif_e)
+```
+
+
+```{r}
+# Drop any rows without a location
+data <- data %>% filter(!is.na(decimalLongitude))
+data <- data %>% filter(!is.na(decimalLatitude))
+
+# Keep only rows with a taxonKey
+work <- data %>% filter(!is.na(taxonKey))
+
+# Extract the list of taxonKeys from which to download location information
+taxa <- work$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 50
+pts_wgs84 <- st_as_sf(work, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+aoi_wkt   <- st_as_text(aoi_wgs84)  # small WKT polygon covering all sites+buffer
+
+```
+
+### Visualise the Area of Interest
+
+Visualising all the sampling points makes it obvious that we have an outlier / data error with one of the samples. We should remove this so that we have a more coherent area of interest.
+
+```{r}
+# Load basemap of Australia
+aus <- rnaturalearth::ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+### Remove invalid lat/lon
+
+```{r}
+# Compute centroid of all sampling points (ignoring NA)
+lat_mean <- mean(data$decimalLatitude, na.rm = TRUE)
+lon_mean <- mean(data$decimalLongitude, na.rm = TRUE)
+
+# Approximate great-circle distance from centroid (km)
+library(geosphere)
+data_with_dist <- data %>%
+  mutate(
+    distance_from_center_km = distHaversine(
+      cbind(decimalLongitude, decimalLatitude),
+      c(lon_mean, lat_mean)
+    ) / 1000
+  ) %>%
+  arrange(desc(distance_from_center_km))
+
+# Show the top 10 farthest points
+data_with_dist %>% select(species, decimalLatitude, decimalLongitude, distance_from_center_km) %>% head(10)
+
+```
+
+The erroneous location has the same Lat/Lon, where the Longitude is invalid. The field "geo_loc_name" is Indian Ocean: Diamantina. A lat/lon of -32.1088, 110.266 would put these samples closer to the Diamantina but not exactly on it. We have decided to correct these values assuming the 210 is a typo that should have been 110.
+
+```{r}
+hist(data$decimalLongitude)
+
+# Filter rows where longitude > 200
+suss_longitudes <- data %>% filter(decimalLongitude > 180)
+print(suss_longitudes)
+
+# Update these rows to the assumed correct lattitude
+data$decimalLongitude[data$decimalLongitude > 180] <- 110.2667
+
+```
+
+### Refit our AOI now that the invalid data has been corrected
+
+```{r}
+# Extract the list of taxonKeys from which to download location information
+taxa <- data$taxonKey %>% unique() %>% as.character()
+
+# Build a compact Area Of Interest (AOI) WKT around all our observed sample locations
+# Use convex hull of all points, then buffer by the validation radius (km) in an AU-friendly CRS
+buffer_km <- 50
+pts_wgs84 <- st_as_sf(data, coords = c("decimalLongitude", "decimalLatitude"), crs = 4326)
+
+# Australia Albers Equal Area (meters) for accurate buffering (converts the degrees of lat/lon to kms)
+pts_aea   <- st_transform(pts_wgs84, 3577)
+hull_aea  <- st_convex_hull(st_union(pts_aea))
+aoi_aea   <- st_buffer(hull_aea, dist = buffer_km * 1000) %>% st_make_valid()
+aoi_wgs84 <- st_transform(aoi_aea, 4326)
+
+# Validate geometry as GBIF requires counter clockwise polygons
+aoi_wgs84 <- st_make_valid(aoi_wgs84)
+
+signed_area <- suppressWarnings(as.numeric(st_area(aoi_wgs84)))
+if (any(signed_area < 0)) {
+  message("AOI polygon is clockwise — reversing orientation to CCW.")
+  aoi_wgs84 <- st_reverse(aoi_wgs84)
+}
+
+aoi_wgs84 <- st_zm(aoi_wgs84)
+
+# If the polygon isn't working use a simple bounding box
+if (!st_is_valid(aoi_wgs84)) {
+  message("AOI polygon still invalid after reversing — using bounding box instead.")
+  bb <- st_bbox(aoi_wgs84)
+  aoi_wkt <- sprintf(
+    "POLYGON((%f %f,%f %f,%f %f,%f %f,%f %f))",
+    bb$xmin, bb$ymin,
+    bb$xmax, bb$ymin,
+    bb$xmax, bb$ymax,
+    bb$xmin, bb$ymax,
+    bb$xmin, bb$ymin
+  )
+} else {
+  aoi_wkt <- st_as_text(aoi_wgs84)
+}
+
+# Create a static map with ggplot2
+# Zoom the plot to the AOI with padding
+bb <- st_bbox(aoi_wgs84)
+pad <- 0.5
+gg <- ggplot() +
+  geom_sf(data = aus, fill = "grey95", color = "grey70", linewidth = 0.3) +
+  geom_sf(data = aoi_wgs84, fill = NA, color = "red", linewidth = 1) +
+  geom_sf(data = pts_wgs84, size = 0.8, alpha = 0.7) +
+  coord_sf(xlim = c(bb$xmin - pad, bb$xmax + pad),
+           ylim = c(bb$ymin - pad, bb$ymax + pad), expand = FALSE) +
+  labs(title = sprintf("AOI (convex hull + %dkm buffer) and sampling sites", buffer_km),
+       subtitle = "Projected in EPSG:4326; AOI built in EPSG:3577 for accurate buffering") +
+  theme_minimal()
+
+print(gg)
+ggsave("../Data/GBIF_AOI_map_fixed.png", gg, width = 8, height = 6, dpi = 300)
+```
+
+## ---GBIF---
+
+### Understand and scope the available GBIF location observation data
+
+Early iterations of our code failed to complete processing due to an out of memory errors as the CSVs downloaded from GBIF for observation data were > 60Gb (and it also took hours to download all the data). The code below does further data exploration to understand how many records there are in GBIF for each species. This can then help us to write better code that uses a representative sample of observations from GBIF rather than downloading every single one.
+
+These raw counts of species observations also provide us with a proxy measure of species abundance with common / high population species expected to have high observation counts compared with rare / low population species.
+
+**NOTE:** It takes about 20 minutes to process the below block. **DO NOT RUN** unless you need to regenerate the counts of species observations from GBIF. I've added a flag to this code block "taxon_count_rebuild" and set to FALSE. This will stop the download happening unless you change this flag to TRUE.
+
+### Obtain counts of observations for each species within the AOI
+
+```{r}
+# Build a vector of taxonKeys
+taxa <- taxonomy$taxonKey %>% unique() %>% na.omit() %>% as.character()
+
+taxon_count_rebuild = FALSE
+
+# Function: count occurrences of each species in the AOI
+count_one <- function(key, wkt = NULL) {
+  tryCatch({
+    res <- occ_search(taxonKey = key, country = "AU",
+                      hasCoordinate = TRUE,
+                      geometry = wkt,
+                      limit = 0)
+    res$meta$count %||% NA_integer_
+  }, error = function(e) NA_integer_)
+}
+
+pb <- progress_bar$new(
+  total = length(taxa),
+  format = "Counting [:bar] :current/:total (:percent) ETA: :eta",
+  clear = FALSE, width = 70
+)
+
+# Query all taxonKeys
+
+if (taxon_count_rebuild==TRUE) {
+  counts <- vector("integer", length(taxa))
+  for (i in seq_along(taxa)) {
+    counts[i] <- count_one(taxa[i], wkt = aoi_wkt)
+    pb$tick()
+  }
+  
+  # Build summary table if it hasn't been down before or if there is fresh downloaded data
+  abundance_tbl <- tibble(taxonKey = as.numeric(taxa), gbif_count_AOI = counts) %>%
+    left_join(taxonomy %>% select(taxonKey, matchedName), by = "taxonKey") %>%
+    arrange(desc(gbif_count_AOI))
+  
+  abundance_tbl <- unique(abundance_tbl)
+  
+  # Write counts out to file so they can be restored easily instead of running this code block every time
+  write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
+}
+
+# Re-import counts if they already exist
+abundance_tbl <- read_csv("../Data/taxonKey_Observation_Counts.csv")
+
+```
+
+
+```{r}
+# Basic stats
+summary(abundance_tbl)
+
+# Plot histogram of species observation counts
+ggplot(abundance_tbl, aes(x = gbif_count_AOI)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  scale_x_log10() +
+  labs(
+    title = "Distribution of GBIF Records per Species in AOI",
+    x = "Number of GBIF records",
+    y = "Number of species"
+  ) +
+  theme_minimal()
+
+
+# Classify species into abundance bins
+abundance_tbl <- abundance_tbl %>%
+  mutate(
+    abundance_class = case_when(
+      is.na(gbif_count_AOI)        ~ NA,
+      gbif_count_AOI == 0          ~ "none",
+      gbif_count_AOI >= 1000       ~ "very_common",
+      gbif_count_AOI >= 200        ~ "common",
+      gbif_count_AOI >= 50         ~ "uncommon",
+      TRUE                         ~ "rare"
+    )
+  )
+
+abundance_tbl %>% count(abundance_class)
+write_csv(abundance_tbl, "../Data/taxonKey_Observation_Counts.csv")
+```
+
+### Merge with GBIF_Taxonomy to create a single source of truth
+
+```{r}
+# Re-import CSVs to make sure we have the right data
+GBIF_Taxonomy <- read_csv("../Data/GBIF_Taxonomy.csv")
+taxonKey_Observation_Counts <- read_csv("../Data/taxonKey_Observation_Counts.csv")
+
+# Make sure the join key has the same type in both data frames
+GBIF_Taxonomy <- GBIF_Taxonomy %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey)))
+
+taxonKey_Observation_Counts <- taxonKey_Observation_Counts %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey)))
+
+# Left join counts to GBIF_Taxonomy
+gbif_joined <- GBIF_Taxonomy %>%
+  left_join(
+    taxonKey_Observation_Counts,
+    by = "taxonKey",
+    suffix = c(".tax", ".obs")
+  ) %>% 
+  select(-matchedName.obs) %>%
+  rename("matchedName" = "matchedName.tax")
+
+# Diagnostics to verify the join was successful
+only_in_tax <- anti_join(GBIF_Taxonomy, taxonKey_Observation_Counts, by = "taxonKey")
+only_in_counts <- anti_join(taxonKey_Observation_Counts, GBIF_Taxonomy, by = "taxonKey")
+
+message("Rows only in GBIF_Taxonomy: ", nrow(only_in_tax))
+message("Rows only in taxonKey_Observation_Counts: ", nrow(only_in_counts))
+
+# Export to CSV
+write_csv(gbif_joined, "../Data/GBIF_Taxonomy.csv")
+
+```
+
+### Download species observation data
+
+#### Function to extract observation data from AOI by species
+
+```{r}
+# Extract Taxon keys from GBIF_Taxonomy
+taxon_keys <- GBIF_Taxonomy %>%
+  mutate(taxonKey = suppressWarnings(as.integer(taxonKey))) %>%
+  filter(!is.na(taxonKey)) %>%
+  pull(taxonKey) %>%
+  unique() %>%
+  sort()
+
+# Setup local cache folder + ability to resume an interrupted download
+obs_dir <- "../Data/SpeciesObservations"
+dir.create(obs_dir, showWarnings = FALSE, recursive = TRUE)
+
+files <- list.files(obs_dir, pattern = "^[0-9]+\\.csv$", full.names = FALSE)
+already_done <- suppressWarnings(as.integer(sub("\\.csv$", "", files)))
+already_done <- already_done[!is.na(already_done)]
+todo <- setdiff(taxon_keys, already_done)
+
+message("Total species: ", length(taxon_keys))
+message("Already cached: ", length(already_done))
+message("Remaining to fetch: ", length(todo))
+
+# Tunables / limits per GBIF API notes
+PAGE_SIZE      <- 300L      # GBIF max per page
+HARD_LIMIT     <- 100000L   # offset + limit must not exceed this
+RATE_DELAY_SEC <- 0.5       # gentle pacing between calls
+MAX_ATTEMPTS   <- 6         # retry attempts on transient errors / 429
+BASE_WAIT_SEC  <- 1         # backoff base (1,2,4,8,...)
+USE_COUNTRY <- FALSE        # set TRUE to force country = "AU"
+
+# Wrapper for search function
+safe_occ_search <- function(..., max_attempts = MAX_ATTEMPTS, base_wait = BASE_WAIT_SEC) {
+  attempt <- 1L
+  repeat {
+    res <- tryCatch(rgbif::occ_search(...), error = identity)
+    if (!inherits(res, "error")) return(res)
+    msg <- conditionMessage(res)
+    if (attempt >= max_attempts) {
+      message("  giving up after ", attempt, " attempts (", msg, ")")
+      return(NULL)
+    }
+    wait <- min(base_wait * 2^(attempt - 1L), 60)
+    if (grepl("Too many requests|429|rate limit", msg, ignore.case = TRUE)) {
+      message("  rate-limited; sleeping ", wait, "s (attempt ", attempt, ")")
+    } else {
+      message("  error: ", msg, " — retrying in ", wait, "s (attempt ", attempt, ")")
+    }
+    Sys.sleep(wait)
+    attempt <- attempt + 1L
+  }
+}
+
+# Fetch all lat/lon for one taxonKey within AOI (respects 100k cap)
+fetch_one_key_throttled <- function(key, wkt, use_country = USE_COUNTRY) {
+  # Preflight: count only
+  meta0 <- safe_occ_search(
+    taxonKey      = key,
+    hasCoordinate = TRUE,
+    geometry      = wkt,
+    country       = if (isTRUE(use_country)) "AU" else NULL,
+    limit         = 0
+  )
+  total <- tryCatch(meta0$meta$count, error = function(e) NA_integer_)
+  if (!is.na(total) && total > HARD_LIMIT) {
+    message("  key=", key, " has ", total, " records; truncating at ", HARD_LIMIT,
+            " (use occ_download() if you need all rows).")
+  }
+  page_target <- if (is.na(total)) HARD_LIMIT else min(total, HARD_LIMIT)
+
+  start <- 0L
+  out <- list()
+
+  while (start < page_target) {
+    current_limit <- min(PAGE_SIZE, HARD_LIMIT - start, page_target - start)
+    if (current_limit <= 0L) break
+
+    # Ask GBIF for only what we need: lat/lon + simple name fields + record key
+    # Ask GBIF for only what we need
+    x <- safe_occ_search(
+      taxonKey      = key,
+      hasCoordinate = TRUE,
+      geometry      = wkt,
+      country       = if (isTRUE(use_country)) "AU" else NULL,
+      start         = start,
+      limit         = current_limit,
+      fields        = c("decimalLatitude", "decimalLongitude", "species", "scientificName", "canonicalName", "taxonKey")
+    )
+    if (is.null(x) || is.null(x$data) || nrow(x$data) == 0) break
+    
+    df_page <- x$data
+    
+    # Ensure referenced columns exist (create as NA if GBIF omitted them)
+    needed <- c("species", "scientificName", "canonicalName", "taxonKey", "decimalLatitude", "decimalLongitude")
+    for (nm in needed) {
+      if (!nm %in% names(df_page)) df_page[[nm]] <- NA
+    }
+    
+    out[[length(out) + 1L]] <- df_page %>%
+      transmute(
+        requested_taxonKey = as.integer(key),
+        record_taxonKey    = suppressWarnings(as.integer(taxonKey)),
+        species_name       = dplyr::coalesce(species, scientificName, canonicalName),
+        decimalLatitude    = suppressWarnings(as.numeric(decimalLatitude)),
+        decimalLongitude   = suppressWarnings(as.numeric(decimalLongitude))
+      ) %>%
+      filter(!is.na(decimalLatitude), !is.na(decimalLongitude))
+    
+    got <- nrow(x$data)
+    start <- start + got
+    Sys.sleep(RATE_DELAY_SEC)
+    if (got < current_limit) break
+
+  }
+
+  if (length(out) == 0) {
+    tibble(
+      requested_taxonKey = as.integer(key),
+      record_taxonKey    = integer(),
+      species_name       = character(),
+      decimalLatitude    = double(),
+      decimalLongitude   = double()
+    )
+  } else {
+    bind_rows(out)
+  }
+}
+
+
+# Progress bar + loop (calls fetch_one_key_throttled, not download_one_key)
+pb <- progress_bar$new(
+  total = length(todo),
+  format = "occ_search [:bar] :current/:total (:percent) eta: :eta"
+)
+
+for (key in todo) {
+  out_path <- file.path(obs_dir, paste0(key, ".csv"))
+  df <- fetch_one_key_throttled(key, aoi_wkt)
+  write_csv(df, out_path)   # write even if empty -> resume-friendly
+  pb$tick()
+  Sys.sleep(RATE_DELAY_SEC)        # small pause between species
+}
+
+message("Done. Cached files in: ", obs_dir)
+
+# Create an index summary
+files <- list.files(obs_dir, pattern = "^[0-9]+\\.csv$", full.names = TRUE)
+if (length(files) > 0) {
+  obs_summary <- tibble(file = files) %>%
+    mutate(
+      taxonKey = as.integer(sub("\\.csv$", "", basename(file))),
+      n_rows   = vapply(
+        file,
+        function(p) nrow(suppressWarnings(readr::read_csv(p, show_col_types = FALSE))),
+        integer(1)
+      )
+    ) %>%
+    arrange(desc(n_rows))
+  readr::write_csv(obs_summary, file.path(obs_dir, "_index.csv"))
+}
+
+
+```
+
+### Compare sample Lat/Lon to GBIF species observations
+
+```{r}
+# ---- Settings ---------------------------------------------------------------
+obs_dir <- "../Data/SpeciesObservations"   # where taxonKey CSVs live
+sample_lat_col <- "decimalLatitude"        # Name of latitude column
+sample_lon_col <- "decimalLongitude"       # Name of longitude column
+.obs_cache <- new.env(parent = emptyenv()) # Cache each taxon in memory
+
+
+# ---- Function to load CSVs and compare lat/lon values -----------------------
+get_obs_points <- function(taxon_key) {
+  if (is.na(taxon_key)) return(NULL)
+  key <- as.character(taxon_key)
+
+  if (exists(key, envir = .obs_cache, inherits = FALSE))
+    return(get(key, envir = .obs_cache, inherits = FALSE))
+
+  path <- file.path(obs_dir, paste0(key, ".csv"))
+  if (!file.exists(path)) return(NULL)
+
+  obs <- read_csv(
+    path,
+    col_types = cols(
+      .default = col_skip(),
+      decimalLongitude = col_double(),
+      decimalLatitude  = col_double()
+    ),
+    show_col_types = FALSE
+  ) |>
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) |>
+    distinct(decimalLongitude, decimalLatitude)
+
+  if (nrow(obs) == 0) return(NULL)
+
+  pts <- as.matrix(obs[, c("decimalLongitude", "decimalLatitude")])  # [lon, lat]
+  assign(key, pts, envir = .obs_cache)
+  pts
+}
+
+nearest_obs_distance_m <- function(sample_lat, sample_lon, taxon_key) {
+  if (is.na(sample_lat) || is.na(sample_lon) || is.na(taxon_key)) return(NA_real_)
+  pts <- get_obs_points(taxon_key)
+  if (is.null(pts)) return(NA_real_)
+  ref <- c(sample_lon, sample_lat)                 # distHaversine expects [lon, lat]
+  min(distHaversine(pts, ref))
+}
+
+# ---- Apply to data frame ----------------------------------------------
+# Create new column with distance from sample to nearest observation in metres
+data <- data |>
+  mutate(
+    nearest_obs_m = mapply(
+      nearest_obs_distance_m,
+      .data[[sample_lat_col]],
+      .data[[sample_lon_col]],
+      taxonKey
+    )
+  )
+
+# Create new boolean columns where TRUE if nearest distance is within 20km / 50km / 100km
+data$nearest_obs_20km <- data$nearest_obs_m < 20000
+data$nearest_obs_50km <- data$nearest_obs_m < 50000
+data$nearest_obs_100km <- data$nearest_obs_m < 100000
+
+```
+
+## ---AQUAMAPS---
+
+### Download Species Location Data
+
+Tool to download information from Aquamaps
+
+```{r}
+# Import list of species from Philipp's file
+tsvcolnames <- c("Species","DNA_Counts")
+species_list <- read_tsv("../Data/OceanGenomes.CuratedNT.NBDLTranche1and2and3.CuratedBOLD.species_counts.tsv", col_names=tsvcolnames)
+all_species <- species_list$Species
+all_species <- unique(all_species)
+
+# Merge with Philipp's list removing "dropped", NAs, trailing white space and duplicates
+all_species <- c(all_species, unique(data$species)) %>% trimws %>% unique() %>%   setdiff(c("", NA, "dropped"))
+
+# Create empty lists to hold the data
+urls        <- c()
+destfiles   <- c()
+
+# Download the AquaMaps data for each species to the "AquaMaps" folder in the "Data" folder
+for(i in all_species){
+    i <- gsub("[/\\\\:] ", "_", i)   # turn any problem characters into _
+    url      <- paste0("https://thredds.d4science.org/thredds/fileServer/public/netcdf/AquaMaps_11_2019/", i, ".nc")
+    destfile <- paste0("../Data/AquaMaps/", i, ".nc")
+    destfile <- gsub(':', 'X', destfile )
+    if(! file.exists(paste0("../Data/AquaMaps/", i, ".nc")) ) {
+        urls      <- c(urls, url)
+        destfiles <- c(destfiles, destfile)
+    }
+}
+
+res       <- multi_download(urls, destfiles)
+delete_us <- res$destfile[res$status_code == "404"]
+file.remove(delete_us)
+```
+
+
+
+
+#### Inspect a single Aquamaps NC file to understand the NC format
+
+```{r}
+# Choose a single file (change name to one that exists in ../Data/AquaMaps/)
+file <- "../Data/AquaMaps/Diaphus_aliciae.nc"
+
+# Load as a raster
+r <- terra::rast(file)
+
+# Inspect contents
+r
+
+#> class       : SpatRaster 
+#> dimensions  : 360, 720, 1  (nrow, ncol, nlyr)
+#> resolution  : 0.5, 0.5  (degrees)
+#> extent      : -180, 180, -90, 90
+#> coord. ref. : lon/lat WGS84 
+#> source(s)   : ../Data/AquaMaps/Thunnus_albacares.nc 
+#> name(s)     : Probability   (or similar)
+
+# Plot the location data
+plot(r, main="Predicted habitat probability")
+
+# Extract the probability for a species at a specific location
+sample_lat <- -28.67171667
+sample_lon <- 111.4407833
+value <- terra::extract(r, cbind(sample_lon, sample_lat))
+print(value)
+
+```
+
+#### Identify corrupted / unopenable files and remove them
+
+About half the files downloaded aren't valid distribution data (not sure if this is due to a lack of a match to the species name or if AquaMaps simple doesn't have any data). This code block deletes these files.
+
+```{r}
+# PART A: AUDIT OF DOWNLOADED .NC FILES TO SEE WHAT'S BROKEN
+nc_dir <- "../Data/AquaMaps"
+nc_files <- dir_ls(nc_dir, glob = "*.nc")
+
+audit <- tibble(
+  file  = nc_files,
+  token = basename(nc_files),
+  size  = file_info(nc_files)$size
+) %>%
+  mutate(
+    is_zero = size == 0
+  )
+
+# Helper: detect file "signature" (NetCDF-3 vs HDF5 vs other)
+sig_kind <- function(path) {
+  con <- file(path, "rb"); on.exit(close(con), add = TRUE)
+  raw <- try(readBin(con, what = "raw", n = 8), silent = TRUE)
+  if (inherits(raw, "try-error") || length(raw) == 0) return("unreadable")
+  # NetCDF-3 starts with 'CDF'
+  if (length(raw) >= 3 && identical(raw[1:3], charToRaw("CDF"))) return("netcdf3")
+  # NetCDF-4/HDF5 starts with 0x89 0x48 0x44 0x46 i.e. \x89 H D F
+  if (length(raw) >= 4 && identical(raw[1:4], as.raw(c(0x89, 0x48, 0x44, 0x46)))) return("hdf5")
+  # Quick HTML sniff (sometimes a 404 page saved as .nc)
+  text <- suppressWarnings(rawToChar(raw[raw >= as.raw(0x20) & raw <= as.raw(0x7E)], multiple = TRUE))
+  if (length(text) && grepl("DOCTYPE|<html|HTTP", paste(text, collapse = ""), ignore.case = TRUE)) return("html")
+  "unknown"
+}
+
+audit$signature <- vapply(audit$file, sig_kind, character(1))
+
+# Try opening with ncdf4 as an independent check (GDAL vs NetCDF library)
+can_open_ncdf4 <- function(p) {
+  out <- try({
+    nc <- ncdf4::nc_open(p); on.exit(ncdf4::nc_close(nc), add = TRUE); TRUE
+  }, silent = TRUE)
+  isTRUE(out)
+}
+audit$ncdf4_ok <- vapply(audit$file, can_open_ncdf4, logical(1))
+
+# Summary of what's suspicious
+audit_summary <- audit %>%
+  count(signature, ncdf4_ok, is_zero, name = "n")
+print(audit_summary)
+
+# List the worst offenders (not netcdf & can't open)
+suspect <- audit %>%
+  filter(is_zero | signature %in% c("html", "unknown", "unreadable") | !ncdf4_ok)
+
+# Show which files will be removed
+print(suspect)
+
+# Delete the bad files so they can be re-downloaded cleanly
+bad_files <- suspect$file
+if (length(bad_files)) {
+  file.remove(bad_files)
+  cat("Deleted", length(bad_files), "corrupted or invalid files.\n")
+} else {
+  cat("No corrupted files found.\n")
+}
+
+```
+
+### Build a function that can loop through the entire dataset and apply a probability to the sample location from the AquaMaps .NC files
+
+```{r}
+# PART 1: DATA PREPARATION
+
+# Function to convert species name into matching .nc file structure (Sillago bassensis -> Sillago_bassensis.nc)
+tok <- function(x) {
+  x <- gsub(" ", "_", x)  # AquaMaps convention
+  x <- gsub(":", "X", x)  # filesystem-safe
+  x
+}
+
+# Identify rows with missing/blank/dropped species *before* filename mapping
+data <- data %>%
+  mutate(
+    # use decimalLatitude/decimalLongitude and make numeric helpers for terra::extract
+    lat = as.numeric(decimalLatitude),
+    lon = as.numeric(decimalLongitude),
+    species_trim = trimws(species),
+    has_species  = !is.na(species_trim) & species_trim != "" & species_trim != "dropped",
+    .token = ifelse(has_species, tok(species_trim), NA_character_),
+    .nc    = ifelse(!is.na(.token), file.path("../Data/AquaMaps", paste0(.token, ".nc")), NA_character_),
+    am_prob = NA_real_
+  )
+
+# Build .nc path per-row, create output column
+data <- data %>%
+  mutate(
+    # keep the same mapping (idempotent); columns are already created above
+    .token = .token,
+    .nc    = .nc,
+    am_prob = am_prob
+  )
+
+# Warn about any bad coordinates (still allowed; will return NA)
+bad_lat <- which(!is.na(data$lat) & (data$lat < -90 | data$lat > 90))
+bad_lon <- which(!is.na(data$lon) & (data$lon < -180 | data$lon > 180))
+if (length(bad_lat) || length(bad_lon)) {
+  warning(sprintf("Coords out-of-range: lat=%d, lon=%d", length(bad_lat), length(bad_lon)))
+}
+
+# PART 2: LOOP THROUGH DATAFILE, PROCESSING LOCATION PROBABILITIES FOR EACH SPECIES AND SAMPLES
+species_tokens <- unique(na.omit(data$.token))
+missing_rasters <- character()  # to log which species had no .nc file
+
+for (sp in species_tokens) {
+  idx <- which(data$.token == sp)
+  if (!length(idx)) next
+
+  ncfile <- data$.nc[idx[1]]
+  if (!file.exists(ncfile)) {
+    message("[skip] Missing raster for species token: ", sp)
+    missing_rasters <- c(missing_rasters, sp)
+    next
+  }
+
+  r <- try(rast(ncfile), silent = TRUE)
+  if (inherits(r, "try-error")) {
+    warning("[skip] Failed to open raster: ", ncfile)
+    next
+  }
+
+  # Use only rows with valid numeric coords in bounds
+  valid <- which(
+    !is.na(data$lon[idx]) & !is.na(data$lat[idx]) &
+    data$lon[idx] >= -180 & data$lon[idx] <= 180 &
+    data$lat[idx] >=  -90 & data$lat[idx] <=  90
+  )
+  if (!length(valid)) next  # nothing to extract for this species
+
+  idxv <- idx[valid]
+  pts  <- cbind(data$lon[idxv], data$lat[idxv])   # (lon, lat) order!
+
+  # Use Terra library to extract data from the .nc files
+  vals_df <- terra::extract(r, pts)               # some versions add an 'ID' column
+  if (is.data.frame(vals_df) && "ID" %in% names(vals_df)) {
+    vals_df <- vals_df[, setdiff(names(vals_df), "ID"), drop = FALSE]
+  }
+  vals <- if (is.data.frame(vals_df) && ncol(vals_df) >= 1) vals_df[[1]] else rep(NA_real_, length(idxv))
+
+  # Sanity check: do the lengths of number of species in our data and number of locations from the .nc files match
+  if (length(vals) != length(idxv)) {
+    stop(sprintf("Sanity failed for '%s': got %d values for %d rows.", sp, length(vals), length(idxv)))
+  }
+
+  # Assign back to those valid rows (invalid stay NA)
+  data$am_prob[idxv] <- vals
+}
+
+# PART 3: REPORT ON THE OVERALL PROCESSING
+cat("\nSummary of am_prob:\n")
+print(summary(data$am_prob))
+cat("Rows with NA am_prob:", sum(is.na(data$am_prob)), "\n")
+
+if (length(missing_rasters)) {
+  missing_rasters <- sort(unique(missing_rasters))
+  cat("Species tokens with missing .nc files (first 25 shown):\n")
+  print(head(missing_rasters, 25))
+}
+
+# Optional: which expected files have no match on disk (quick audit)
+tokens_expected <- unique(paste0(na.omit(data$.token), ".nc"))
+files_on_disk  <- list.files("../Data/AquaMaps", pattern = "\\.nc$", full.names = FALSE)
+not_found <- setdiff(tokens_expected, files_on_disk)
+cat("Unmatched tokens (no .nc on disk):", length(not_found), "\n")
+if (length(not_found)) print(head(not_found, 25))
+
+# Glance at results
+head(data[c("species", "decimalLatitude", "decimalLongitude", "am_prob")], 10)
+
+# Export datafile with location probabilities
+head(data)
+data <- data %>% select(-c(lat, lon, species_trim, .token))
+
+# Number of rows with / without location probability
+(sum(!is.na(data$am_prob)))
+(sum(is.na(data$am_prob)))
+
+```
+
+## ---OBIS---
+
+### Create location bounding boxes
+
+```{r 3}
+# FAST AUS BOX + PREFILTER FOR BIG DATA
+
+# ---- Step 1: Simple Rough Australia Bounding Box ----
+get_aus_box_fast <- function() {
+  message("Using rough Australia bbox fallback.")
+
+  # Define the approximate bounding box coordinates
+  # xmin = 105Â°E, ymin = -46Â°S, xmax = 170Â°E, ymax = -8Â°S
+  # This rectangle covers the entire Australian continent and nearby waters.
+  approx_bbox <- c(90, -50, 160, 0)
+
+  # Step 2: Build a rectangular polygon using those coordinates
+  bb_poly <- st_polygon(list(rbind(
+    c(approx_bbox[1], approx_bbox[2]),  # lower-left
+    c(approx_bbox[3], approx_bbox[2]),  # lower-right
+    c(approx_bbox[3], approx_bbox[4]),  # upper-right
+    c(approx_bbox[1], approx_bbox[4]),  # upper-left
+    c(approx_bbox[1], approx_bbox[2])   # close polygon
+  )))
+  
+  # Step 3: Convert to a proper sf spatial object (WGS84 coordinate system)
+  aus_bbox <- st_as_sf(st_sfc(bb_poly, crs = 4326))
+  return(aus_bbox)
+}
+
+# ---- Step 4: Create the bounding box polygon ----
+aus_box <- get_aus_box_fast()
+
+# ---- Step 5: Prefilter your dataset quickly ----
+# Assumes your dataframe is named `df` and includes decimalLongitude / decimalLatitude columns.
+# First, extract the bounding box limits for numeric filtering.
+bb <- st_bbox(aus_box)
+
+# Step 6: Use a simple rectangular filter to remove coordinates outside the box.
+# This is the fastest possible spatial filter before doing expensive geometry joins.
+df_fast <- data %>%
+  filter(
+    !is.na(decimalLongitude), !is.na(decimalLatitude),
+    decimalLongitude >= bb["xmin"],
+    decimalLongitude <= bb["xmax"],
+    decimalLatitude  >= bb["ymin"],
+    decimalLatitude  <= bb["ymax"]
+  )
+
+# Step 7: Convert the remaining rows into sf points (spatial objects)
+pts_fast <- st_as_sf(
+  df_fast,
+  coords = c("decimalLongitude", "decimalLatitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Step 8: Keep only those points that lie within the Australia bounding box polygon
+pts_in_aus <- st_join(pts_fast, aus_box, left = FALSE)
+
+# Step 9: Convert back to a plain dataframe so itâ€™s easy to handle later
+rows_in_aus <- df_fast[as.integer(rownames(pts_in_aus)), , drop = FALSE]
+
+# ---- Step 10: Print quick summary counts ----
+# These counts help verify how many rows were kept at each stage.
+cat("# rows original:   ", nrow(data),        "\n")
+cat("# rows bbox-pass:  ", nrow(df_fast),   "\n")
+cat("# rows inside AUS: ", nrow(pts_in_aus), "\n")
+
+# --- Plot to visualise and make sure the bounding box makes sense ---
+  # Turn bbox into an sf polygon
+  approx_bbox_plot <- c(xmin = 90, ymin = -50, xmax = 160, ymax = 0)
+  bbox_sf <- st_as_sfc(st_bbox(approx_bbox_plot, crs = 4326))
+
+  # Get Australia geometry (WGS84)
+  aus <- ne_countries(scale = "medium", country = "Australia", returnclass = "sf")
+
+  # Plot
+  ggplot() +
+    geom_sf(data = aus, fill = "grey90", color = "grey60") +
+    geom_sf(data = bbox_sf, fill = NA, color = "red", linewidth = 1.1) +
+    coord_sf(
+      xlim = c(approx_bbox_plot["xmin"]-5, approx_bbox_plot["xmax"]+5),
+      ylim = c(approx_bbox_plot["ymin"]-5, approx_bbox_plot["ymax"]+5),
+      expand = FALSE
+    ) +
+    labs(
+      title = "Australia with Bounding Box",
+      subtitle = "xmin=90°E, ymin=50°S, xmax=160°E, ymax=0°S (WGS84 lon/lat)",
+      x = "Longitude (°E)", y = "Latitude (°N/°S)"
+    ) +
+    theme_minimal()
+
+```
+
+### Process OBIS data and distances
+
+```{r}
+
+# OBIS-only workflow: measure how close each sample is to known occurrences
+# ----------------------------------------------------------------------------
+# What this script does :
+# 1) Builds an "Area of Interest" (AOI) around your sampling sites in Australia
+#    using a convex hull + a safety buffer (so we include nearby waters).
+# 2) Extracts clean candidate species names from your data (Species + LCA list).
+# 3) Resolves each species to a stable WoRMS AphiaID (handles synonyms, typos).
+# 4) Fetches occurrence points for each species from OBIS (cached on disk).
+# 5) For every sample, computes the nearest distance to any OBIS record of its
+#    candidate species (and flags within 20/50/100 km).
+# 6) Summarises distances overall and per species, and saves tidy CSV outputs.
+##############################################################################
+
+# Expect an input data.frame `data` with decimalLongitude/decimalLatitude,
+# species, and/or Species_In_LCA columns available.
+
+###############################################################################
+# 1.  DEFINE AREA OF INTEREST (AOI)
+# ----------------------------------------------------------------------------
+# Buffer distance is parameterised; change via options(obis_aoi_buffer_km = 100)
+# CRS and cache dir can also be tweaked via options().
+###############################################################################
+
+buffer_km <- getOption("obis_aoi_buffer_km", 100)   # default 100 km
+aoi_crs_m <- getOption("obis_aoi_crs", 3577)       # EPSG:3577 (Australia Albers, metres)
+simplify_tolerance_deg <- getOption("obis_aoi_simplify_deg", 0.00) # e.g., 0.01 â‰ˆ ~1 km
+
+# Turn your rows into spatial points if you don't already have `pts_in_aus`.
+pts_wgs84 <- if (exists("pts_in_aus")) {
+  pts_in_aus
+} else {
+  st_as_sf(data, coords = c("decimalLongitude","decimalLatitude"),
+               crs = 4326, remove = FALSE)
+}
+
+# Defensive filtering of obviously invalid coordinates
+pts_wgs84 <- pts_wgs84 %>% filter(
+    !is.na(decimalLongitude), !is.na(decimalLatitude),
+    decimalLongitude >= -180, decimalLongitude <= 180,
+    decimalLatitude  >=  -90, decimalLatitude  <=  90
+  )
+
+# Build hull with buffer and convert back to WGS84 (lon/lat) then export as WKT
+pts_aea   <- st_transform(pts_wgs84, aoi_crs_m)
+u         <- st_union(pts_aea)
+# Fallback to union if convex hull fails (e.g., single point)
+hull_aea  <- tryCatch(st_convex_hull(u), error = function(e) u)
+aoi_aea   <- st_make_valid(st_buffer(hull_aea, dist = buffer_km * 1000))
+aoi_wgs84 <- st_zm(st_transform(aoi_aea, 4326))
+
+# Optional: simplify AOI to speed WKT handling (0 disables)
+if (simplify_tolerance_deg > 0) {
+  aoi_wgs84 <- st_simplify(aoi_wgs84, dTolerance = simplify_tolerance_deg)
+}
+
+aoi_wkt   <- st_as_text(aoi_wgs84)   # OBIS understands WKT strings
+
+###############################################################################
+# 2. PREPARE FLAT DATA
+# ----------------------------------------------------------------------------
+
+data_obis <- if (exists("rows_in_aus")) rows_in_aus else if (exists("pts_in_aus")) {
+  st_drop_geometry(pts_in_aus)
+} else st_drop_geometry(pts_wgs84)
+
+# Ensure required columns exist and have the right type.
+for (nm in c("species","Species_In_LCA")) {
+  if (!nm %in% names(data_obis)) data_obis[[nm]] <- NA_character_
+  data_obis[[nm]] <- as.character(data_obis[[nm]])
+}
+for (nm in c("decimalLongitude","decimalLatitude")) {
+  if (!nm %in% names(data_obis)) data_obis[[nm]] <- NA_real_
+}
+
+###############################################################################
+# 3.  EXTRACT CANDIDATE SPECIES NAMES (binomials only)
+# ----------------------------------------------------------------------------
+
+`%||%` <- function(a,b) if (!is.null(a)) a else b
+is_binomial <- function(x) is.character(x) && nzchar(x) && grepl("\\S+\\s+\\S+", x)
+
+extract_candidates <- function(species, Species_In_LCA) {
+  sp  <- str_squish(species %||% "")
+  sil <- str_squish(Species_In_LCA %||% "")
+  if (!identical(tolower(sp), "dropped") && is_binomial(sp)) return(sp)
+  if (nzchar(sil)) {
+    cand <- str_split(sil, ",")[[1]] |> str_squish()
+    cand <- cand[grepl("\\S+\\s+\\S+", cand)] |> unique()
+    if (length(cand)) return(cand)
+  }
+  character(0)
+}
+
+data_obis$candidates <- pmap(
+  data_obis[, c("species","Species_In_LCA")],
+  extract_candidates
+)
+
+# De-duplicate candidate lists (micro-optimisation for fewer OBIS calls)
+data_obis$candidates <- map(data_obis$candidates, ~ unique(.x[nchar(.x) > 0]))
+
+###############################################################################
+# 4. RESOLVE WORMS APHIAID + FETCH OBIS RECORDS (with caching)
+# ----------------------------------------------------------------------------
+
+# In-memory cache for AphiaID lookups.
+.aphia_cache <- new.env(parent = emptyenv())
+
+resolve_aphia <- function(scientific_name) {
+  if (!nzchar(scientific_name)) return(NA_integer_)
+  key <- tolower(scientific_name)
+  if (exists(key, envir = .aphia_cache, inherits = FALSE)) return(get(key, .aphia_cache))
+
+  id <- NA_integer_
+  # Try exact first; if that fails, pull candidate records and prefer accepted species.
+  exact <- tryCatch(wm_name2id(scientificname = scientific_name), error = function(e) NA_integer_)
+  if (!is.na(exact)) {
+    id <- suppressWarnings(as.integer(exact))
+  } else {
+    recs <- tryCatch(wm_records_name(name = scientific_name), error = function(e) NULL)
+    if (!is.null(recs) && length(recs)) {
+      df <- tibble::as_tibble(recs)
+      df <- df %>% arrange(desc(status == "accepted"), desc(rank == "Species"))
+      id <- suppressWarnings(as.integer(df$AphiaID[1]))
+    }
+  }
+  assign(key, id, envir = .aphia_cache)
+  id
+}
+
+# Explicit, configurable cache directory for per-species OBIS CSVs
+occ_dir <- getOption("obis_occ_dir", "../Data/SpeciesPoints_OBIS")
+dir.create(occ_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Gentle wrapper to handle OBIS hiccups quietly
+safe_occurrence <- function(...) tryCatch(robis::occurrence(...), error = function(e) NULL)
+
+# Get OBIS occurrence points for one species: AOI first; if empty, try global.
+get_species_points_obis <- function(sp, wkt = NULL) {
+  if (!nzchar(sp)) return(tibble())
+  safe <- gsub("[^A-Za-z0-9_]+","_", sp)
+  out_path <- file.path(occ_dir, paste0(safe, ".csv"))
+
+  # Reuse cached CSV if present.
+  if (file.exists(out_path)) {
+    df <- suppressMessages(readr::read_csv(out_path, show_col_types = FALSE))
+    return(df %>% filter(!is.na(decimalLongitude), !is.na(decimalLatitude)))
+  }
+
+  fetch_once <- function(geom = NULL, aphia = NA_integer_) {
+    if (!is.na(aphia)) safe_occurrence(taxonid = aphia, geometry = geom)
+    else               safe_occurrence(scientificname = sp, geometry = geom)
+  }
+
+  aphia <- resolve_aphia(sp)
+
+  # Prefer AOI-constrained fetch to keep results tight; fall back to global if empty.
+  ob <- fetch_once(wkt, aphia)
+  if (is.null(ob) || !nrow(ob)) ob <- fetch_once(NULL, aphia)
+
+  # If still empty, write an empty CSV so we donâ€™t retry this species repeatedly.
+  if (is.null(ob) || !nrow(ob)) {
+    readr::write_csv(tibble(species = character(), decimalLongitude = double(), decimalLatitude = double()),
+                     out_path)
+    return(tibble())
+  }
+
+  df <- ob %>%
+    transmute(
+      species          = sp,
+      decimalLongitude = suppressWarnings(as.numeric(decimalLongitude)),
+      decimalLatitude  = suppressWarnings(as.numeric(decimalLatitude))
+    ) %>%
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude)) %>%
+    distinct()
+
+    # small politeness pause to be nice to OBIS
+  Sys.sleep(getOption("obis_pause_sec", 0.1))
+
+  df
+}
+
+###############################################################################
+# 5.  BUILD SPECIES LIST + LIGHTWEIGHT INDEX
+# ----------------------------------------------------------------------------
+
+uniq_species <- unique(unlist(data_obis$candidates, use.names = FALSE))
+uniq_species <- uniq_species[nzchar(uniq_species)]
+
+message("Unique species (OBIS-only) to fetch: ", length(uniq_species))
+
+index_tbl <- tibble(candidate = uniq_species) %>%
+  mutate(n_rows = map_int(candidate, ~ nrow(get_species_points_obis(.x, aoi_wkt))))
+readr::write_csv(index_tbl, file.path(occ_dir, "_index.csv"))
+
+###############################################################################
+###############################################################################
+# 6. NEAREST-DISTANCE CALCULATION PER SAMPLE
+# ----------------------------------------------------------------------------
+# - nearest_obis_m:        minimum distance (metres) to any candidate's OBIS point
+# - nearest_obis_min_km:   same as above, in kilometres (rounded)
+# - nearest_obis_all_km:   comma-separated per-candidate minimum distances (km),
+#                          in the SAME ORDER as `candidates` / Species_In_LCA
+# - obis_within_*km:       TRUE/FALSE using the minimum distance
+# - obis_within_*km_all:   comma-separated TRUE/FALSE per candidate (optional)
+###############################################################################
+
+# Small in-memory cache so we don't re-read the same species CSV repeatedly
+.pts_cache <- new.env(parent = emptyenv())
+get_cached_pts <- function(sp) {
+  if (exists(sp, envir = .pts_cache, inherits = FALSE)) return(get(sp, .pts_cache))
+  df <- get_species_points_obis(sp, aoi_wkt)
+  assign(sp, df, envir = .pts_cache)
+  df
+}
+
+# Minimum distance (metres) from a sample to ANY of the candidates' OBIS points
+dist_min_m <- function(sample_lon, sample_lat, species_vec) {
+  if (is.na(sample_lon) || is.na(sample_lat) || length(species_vec) == 0) return(NA_real_)
+  ref <- c(sample_lon, sample_lat) # (lon, lat)
+
+  mins <- map_dbl(species_vec, function(sp) {
+    pts <- get_cached_pts(sp)
+    if (!nrow(pts)) return(Inf)
+    geosphere::distHaversine(
+      as.matrix(pts[, c("decimalLongitude","decimalLatitude")]),
+      ref
+    ) |> min(na.rm = TRUE)
+  })
+
+  d <- suppressWarnings(min(mins, na.rm = TRUE))
+  if (is.infinite(d)) NA_real_ else d
+}
+
+# Per-candidate minimum distances (kilometres), preserving the input order
+dist_each_km <- function(sample_lon, sample_lat, species_vec) {
+  if (is.na(sample_lon) || is.na(sample_lat) || length(species_vec) == 0) return(numeric(0))
+  ref <- c(sample_lon, sample_lat)
+
+  purrr::map_dbl(species_vec, function(sp) {
+    pts <- get_cached_pts(sp)
+    if (!nrow(pts)) return(Inf)
+    m <- geosphere::distHaversine(
+      as.matrix(pts[, c("decimalLongitude","decimalLatitude")]),
+      ref
+    ) |> min(na.rm = TRUE)
+    m / 1000  # km
+  })
+}
+
+# Compute min distance and per-candidate distances
+data_obis$nearest_obis_m <- mapply(
+  dist_min_m,
+  data_obis$decimalLongitude,
+  data_obis$decimalLatitude,
+  data_obis$candidates,
+  SIMPLIFY = TRUE
+)
+
+data_obis$nearest_obis_all_km <- mapply(
+  function(lon, lat, vec) {
+    d <- dist_each_km(lon, lat, vec)
+    if (!length(d)) return(NA_character_)
+    paste0(round(d, 2), collapse = ",")
+  },
+  data_obis$decimalLongitude,
+  data_obis$decimalLatitude,
+  data_obis$candidates,
+  SIMPLIFY = TRUE
+)
+
+# Convenience flags: min-distance thresholds (as before)
+data_obis <- data_obis %>%
+  dplyr::mutate(
+    nearest_obis_min_km = round(nearest_obis_m / 1000, 2),
+    obis_within_20km    = nearest_obis_m <  20e3,
+    obis_within_50km    = nearest_obis_m <  50e3,
+    obis_within_100km   = nearest_obis_m < 100e3
+  )
+
+# OPTIONAL: per-candidate TRUE/FALSE strings for the same thresholds,
+# aligned with the order in `nearest_obis_all_km` / `candidates`.
+split_to_num <- function(x) {
+  if (is.na(x) || !nzchar(x)) return(numeric(0))
+  as.numeric(strsplit(x, ",", fixed = TRUE)[[1]])
+}
+mk_flag_str <- function(km_str, cutoff_km) {
+  d <- split_to_num(km_str)
+  if (!length(d)) return(NA_character_)
+  paste0(ifelse(is.finite(d) & d < cutoff_km, "TRUE", "FALSE"), collapse = ",")
+}
+
+data_obis <- data_obis %>%
+  mutate(
+    obis_within_20km_all  = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 20),
+    obis_within_50km_all  = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 50),
+    obis_within_100km_all = vapply(nearest_obis_all_km, mk_flag_str, character(1), cutoff_km = 100)
+  )
+
+###############################################################################
+#  7.  SUMMARIES: OVERALL + PER-SPECIES QUANTILES
+# ----------------------------------------------------------------------------
+
+overall_50pct_km <- quantile(data_obis$nearest_obis_m, 0.5, na.rm = TRUE) / 1000
+message(sprintf("Overall 50%% probability distance (OBIS-only): %.1f km", overall_50pct_km))
+
+first_binomial <- function(cands) { x <- cands[grepl("\\S+\\s+\\S+", cands)]; if (length(x)) x[1] else NA_character_ }
+data_obis$primary_candidate <- vapply(data_obis$candidates, first_binomial, character(1))
+
+per_species_quant_obis <- data_obis %>%
+  filter(!is.na(nearest_obis_m), !is.na(primary_candidate)) %>%
+  group_by(primary_candidate) %>%
+  summarise(
+    n_rows = n(),
+    p50_km = quantile(nearest_obis_m, 0.5, na.rm = TRUE) / 1000,
+    p80_km = quantile(nearest_obis_m, 0.8, na.rm = TRUE) / 1000,
+    p95_km = quantile(nearest_obis_m, 0.95, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_rows))
+
+###############################################################################
+# 8.  SAVE OUTPUTS + LIGHT DIAGNOSTICS
+# ----------------------------------------------------------------------------
+
+write_csv(per_species_quant_obis, "../Data/OBIS_distance_quantiles_per_species.csv")
+
+cat("\nExample candidates (first 3 rows):\n"); print(head(data_obis$candidates, 3))
+if (length(uniq_species)) {
+  test_sp <- uniq_species[1]; tmp <- get_cached_pts(test_sp)
+  cat("\nTest species (OBIS-only):", test_sp, "->", nrow(tmp), "points\n"); print(head(tmp, 3))
+}
+cat(sprintf("\nRows with OBIS distances: %d / %d\n",
+            sum(!is.na(data_obis$nearest_obis_m)), nrow(data_obis)))
+summary(data_obis$nearest_obis_m)
+
+head(data_obis)
+
+# Join columns from data_obis to the main dataframe
+obis_cols <- c(
+  "nearest_obis_m", "nearest_obis_min_km", "nearest_obis_all_km", 
+  "obis_within_20km", "obis_within_50km", "obis_within_100km"
+)
+
+# Check join columns are still unique
+nrow(dplyr::distinct(data_obis, ASV, sample))
+nrow(data_obis)
+nrow(dplyr::distinct(data, ASV, sample))
+nrow(data)
+
+data <- data %>%
+  left_join(
+    data_obis %>% select(ASV, sample, Assay, all_of(obis_cols)),
+    by = c("ASV", "sample", "Assay")
+  )
+
+head(data)
+```
+#### Investigating duplicate rows
+
+```{r}
+dplyr::count(data, ASV, sample) %>% dplyr::filter(n > 1)
+
+```
+## ---FISHBASE/OBIS SUMMARY TABLES---
+
+```{r fishbase_obis_evidence}
+# ---BUILDS SUMMARY TABLES ABOUT OBIS DATA FOR EACH SPECIES---
+occ_dir <- getOption("obis_occ_dir", "../Data/SpeciesPoints_OBIS")
+dir.create(occ_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- Pick a source table that actually exists ----------
+# Prefer rows filtered to Australia if you ran the bbox step; else fall back to df/result_tbl.
+src <- if (exists("rows_in_aus")) {
+  rows_in_aus
+} else if (exists("result_tbl")) {
+  result_tbl
+} else {
+  df
+}
+
+# Helper to safely pick the first existing column name from a set
+pick_col <- function(dat, candidates) {
+  nm <- intersect(candidates, names(dat))[1]
+  if (is.na(nm)) NULL else nm
+}
+
+# Identify column names for species list and ASV/sample (handles both original and snake_case)
+col_species_lca <- pick_col(src, c("Species_In_LCA","species_in_lca","LCA","lca","species"))
+col_asv         <- pick_col(src, c("ASV","asv"))
+col_sample      <- pick_col(src, c("sample","Sample","SAMPLE"))
+
+# If no species column exists, create an empty one to keep pipeline robust
+if (is.null(col_species_lca)) {
+  src$Species_In_LCA <- NA_character_
+  col_species_lca <- "Species_In_LCA"
+}
+
+# ---------- Build unique, well-formed candidate names (binomials) ----------
+# Vectorized: returns a logical vector the same length as x
+is_binomial <- function(x) {
+  x <- as.character(x)
+  !is.na(x) & nzchar(x) & grepl("\\S+\\s+\\S+", x)
+}
+
+all_candidates <- src %>%
+  transmute(Species_In_LCA = .data[[col_species_lca]]) %>%
+  filter(!is.na(Species_In_LCA), nzchar(Species_In_LCA)) %>%
+  separate_rows(Species_In_LCA, sep = ",") %>%
+  mutate(candidate = stringr::str_squish(Species_In_LCA)) %>%
+  filter(is_binomial(candidate)) %>%
+  distinct(candidate)
+
+
+# Shortcut: if you already wrote per-species OBIS CSVs in occ_dir, we can
+# check AU presence by intersecting those cached points with aus_box.
+# If a CSV is missing, we treat it as zero hits (you can run the OBIS fetcher first).
+
+read_cached_obis <- function(sp, occ_dir) {
+  safe <- gsub("[^A-Za-z0-9_]+","_", sp)
+  path <- file.path(occ_dir, paste0(safe, ".csv"))
+  if (!file.exists(path)) return(tibble(decimalLongitude = numeric(), decimalLatitude = numeric()))
+  suppressMessages(readr::read_csv(path, show_col_types = FALSE)) %>%
+    filter(!is.na(decimalLongitude), !is.na(decimalLatitude))
+}
+
+obis_hits_in_aus_box <- function(sp, aus_poly, occ_dir) {
+  pts <- read_cached_obis(sp, occ_dir)
+  if (!nrow(pts)) return(0L)
+  sfpts <- sf::st_as_sf(pts, coords = c("decimalLongitude","decimalLatitude"), crs = 4326, remove = FALSE)
+  sfpts <- suppressWarnings(sf::st_make_valid(sfpts))
+  hits  <- suppressWarnings(sf::st_intersects(sfpts, aus_poly, sparse = TRUE))
+  sum(lengths(hits) > 0L)
+}
+
+# ---------- FishBase country presence (AU) via parquet mirrors ----------
+cache_dir <- "fishbase_cache"; dir.create(cache_dir, showWarnings = FALSE)
+
+dl <- function(url, fname) {
+  path <- file.path(cache_dir, fname)
+  if (!file.exists(path)) download.file(url, path, mode = "wb", quiet = TRUE)
+  path
+}
+
+species_path <- dl(
+  "https://huggingface.co/datasets/cboettig/fishbase/resolve/main/data/fb/v24.07/parquet/species.parquet?download=true",
+  "species.parquet"
+)
+syn_path <- dl(
+  "https://huggingface.co/datasets/cboettig/fishbase/resolve/main/data/fb/v24.07/parquet/synonyms.parquet?download=true",
+  "synonyms.parquet"
+)
+country_path <- dl(
+  "https://huggingface.co/datasets/cboettig/fishbase/resolve/main/data/fb/v24.07/parquet/country.parquet?download=true",
+  "country.parquet"
+)
+
+species_df <- read_parquet(species_path) %>% select(SpecCode, Genus, Species)
+syn_df     <- read_parquet(syn_path)     %>% select(SpecCode, SynGenus, SynSpecies)
+country_df <- read_parquet(country_path)
+
+spec_col  <- grep("spec",  names(country_df), ignore.case = TRUE, value = TRUE)[1]
+ccode_col <- grep("c[_]?code", names(country_df), ignore.case = TRUE, value = TRUE)[1]
+
+country_df <- country_df %>% select(SpecCode = all_of(spec_col), C_Code = all_of(ccode_col))
+au_df      <- country_df %>% filter(C_Code %in% c(36, "36", "036"))
+
+name_to_speccode <- function(sciname) {
+  if (is.na(sciname) || !nzchar(sciname) || !grepl("\\s", sciname)) return(NA_integer_)
+  parts <- str_split(sciname, "\\s+", n = 2, simplify = TRUE)
+  G <- parts[1,1]; S <- parts[1,2]
+  hit <- species_df %>% filter(Genus == G, Species == S) %>% slice_head(n = 1)
+  if (nrow(hit) == 1) return(hit$SpecCode[[1]])
+  syn <- syn_df %>% filter(SynGenus == G, SynSpecies == S) %>% slice_head(n = 1)
+  if (nrow(syn) == 1) return(syn$SpecCode[[1]])
+  NA_integer_
+}
+is_in_au <- function(code) if (is.na(code)) NA else any(au_df$SpecCode == code)
+
+# ---------- Build the truth table (one row per species) ----------
+species_truth <- all_candidates %>%
+  mutate(
+    SpecCode       = map_int(candidate, name_to_speccode),
+    fb_in_AU       = map_lgl(SpecCode, is_in_au),
+    obis_hits_AU   = map_int(candidate, ~ obis_hits_in_aus_box(.x, aus_box, occ_dir)),
+    obis_in_AU     = obis_hits_AU > 0L,
+    any_evidence   = fb_in_AU | obis_in_AU
+  ) %>%
+  select(candidate, SpecCode, fb_in_AU, obis_in_AU, obis_hits_AU, any_evidence) %>%
+  arrange(desc(any_evidence), desc(obis_hits_AU), desc(fb_in_AU), candidate)
+
+readr::write_csv(species_truth, "../Data/species_in_LCA_truth_table.csv")
+
+# ---------- Expand back to per-row × candidate ----------
+per_row_truth <- src %>%
+  mutate(row_id = dplyr::row_number()) %>%
+  transmute(
+    row_id,
+    ASV    = if (!is.null(col_asv))    .data[[col_asv]]    else NA,
+    sample = if (!is.null(col_sample)) .data[[col_sample]] else NA,
+    Species_In_LCA = .data[[col_species_lca]]
+  ) %>%
+  filter(!is.na(Species_In_LCA), nzchar(Species_In_LCA)) %>%
+  separate_rows(Species_In_LCA, sep = ",") %>%
+  mutate(candidate = str_squish(Species_In_LCA)) %>%
+  filter(is_binomial(candidate)) %>%
+  left_join(species_truth, by = "candidate") %>%
+  select(row_id, ASV, sample, candidate, fb_in_AU, obis_in_AU, obis_hits_AU, any_evidence)
+
+readr::write_csv(per_row_truth, "../Data/species_in_LCA_truth_per_row.csv")
+
+# ---------- Quick diagnostics ----------
+cat("\n# unique candidates:", nrow(species_truth), "\n")
+print(head(species_truth, 10))
+cat("\n# per-row × candidate rows:", nrow(per_row_truth), "\n")
+print(head(per_row_truth, 10))
+# ================================================================
+
+```
+
+# PROCESS DNA RELATED DATA
+
+## ---eDNA GENUS COMPLETENESS---
+
+These CSVs are downloaded from https://shiny.cefe.cnrs.fr/GAPeDNA/ based on the following selections:
+
+* Taxon: Marine Fish
+* Resolution: Provinces
+* Mitochondrial Position: 12S + Primer Pair: Miya_12S
+* Mitochondrial Position: 16S + Primer Pair: DiBattista_16S
+
+Note: Client uses Berry_16S but that isn't an available filter. DiBattista appears to have the best coverage of the available primer pairs for 16S analysis so an assumption is made that this will provide sufficient estimation of comparable Berry_16S coverage.
+
+### Load data
+
+CSV inputs for each region for each of the 12S and 16S assay types needs to be loaded and processed
+
+```{r}
+# Manually enter regions exactly as they appear in the filenames
+regions <- c(
+  "East Central Australian Shelf",
+  "Northeast Australian Shelf",
+  "Northwest Australian Shelf",
+  "Sahul Shelf",
+  "Southeast Australian Shelf",
+  "Southwest Australian Shelf",
+  "West Central Australian Shelf"
+)
+
+# Directory containing the CSVs
+data_dir <- "../Data"
+
+# Filename templates for each assay
+templates <- list(
+  `12S` = "Marine fish_Miya_12S_%s.csv",
+  `16S` = "Marine fish_DiBattista_16S_%s.csv"
+)
+
+# Function to simplify region names
+clean_name <- function(x) {
+  x <- gsub("Australian|Shelf", "", x, ignore.case = TRUE)
+  x <- gsub("\\s+", "", x)
+  make.names(x)
+}
+
+
+```
+
+#### Function to process and join the CSV files
+
+```{r}
+
+merge_csvs <- function(assay=NULL, regions=NULL, data_dir=NULL, templates=NULL) {
+  
+  # Get filename template for the assay type and sanity-check it
+  template <- templates[[assay]]
+  if (is.null(template)) {
+    stop(sprintf("Assay '%s' not found in 'templates'.", assay))
+  }
+  if (!grepl("%s", template, fixed = TRUE)) {
+    stop(sprintf("Template for assay '%s' must include '%%s' for the region name.", assay))
+  }
+
+  # Build file paths for regions
+  files <- file.path(data_dir, sprintf(template, regions))
+
+  # Process column labels
+  region_labels <- vapply(regions, clean_name, character(1))
+
+  # Check existence and report any missing files clearly
+  if (any(!file.exists(files))) {
+    missing <- files[!file.exists(files)]
+    stop("These files do not exist:\n", paste(missing, collapse = "\n"))
+  }
+
+  # Read -> select -> rename for each region, then full-join by Species
+  df_list <- map2(files, region_labels, function(path, col_label) {
+    read_csv(path, show_col_types = FALSE) %>%
+      select(Species, Sequenced) %>%
+      rename(!!col_label := Sequenced)
+  })
+
+  merged <- reduce(df_list, ~ full_join(.x, .y, by = "Species")) %>%
+    relocate(Species, .before = 1)
+
+  merged
+}
+
+# 12S merged coverage (Species + one column per region)
+merged_12S_coverage <- merge_csvs("12S", regions, data_dir, templates)
+head(merged_12S_coverage)
+
+# 16S merged coverage
+merged_16S_coverage <- merge_csvs("16S", regions, data_dir, templates)
+head(merged_16S_coverage)
+
+```
+
+#### Validate rows
+
+```{r}
+check_conflicts <- function(merged_df) {
+  conflicts <- merged_df %>%
+    rowwise() %>%
+    filter(
+      any(c_across(-Species) == "Yes", na.rm = TRUE) &
+      any(c_across(-Species) == "No",  na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  if (nrow(conflicts) == 0) {
+    message("✅ No conflicts found: no species have both 'Yes' and 'No' across regions.")
+  } else {
+    message("⚠️ Conflicts found! The following species have mixed Yes/No results:")
+    print(conflicts)
+  }
+
+  invisible(conflicts)
+}
+
+# Check conflicts for 12S
+conflicts_12S <- check_conflicts(merged_12S_coverage)
+
+# Check conflicts for 16S
+conflicts_16S <- check_conflicts(merged_16S_coverage)
+
+```
+
+```{r}
+# Split the "Species" column as it actually contains Genus and Species together
+merged_12S_coverage <- merged_12S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+
+merged_16S_coverage <- merged_16S_coverage %>%
+  rename(genus_species = Species) %>%
+  separate(genus_species, into = c("Genus", "Species"), sep = "_", remove=FALSE)
+```
+
+Checking the warning rows to see what's happened. Looks like the species name is duplicated in most cases and in a small number of others it's a subspecies. Searching for these sub species on Obis.org they're not classed as valid (i.e. https://obis.org/taxon/236453) so the parent species should be sufficient for our needs.
+
+```{r}
+problem_rows_12 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
+problem_rows_16 <- merged_12S_coverage %>% filter(grepl("_.*_", genus_species))
+
+# Inspect them
+print(problem_rows_12)
+print(problem_rows_16)
+```
+
+
+## Calculate species DNA coverage
+
+### Generate 12S and 16S summaries
+
+```{r}
+calc_genus_coverage <- function(merged_df, region_cols = NULL) {
+  # If no region_cols are provided, use all except Species and Genus
+  if (is.null(region_cols)) {
+    region_cols <- setdiff(names(merged_df), c("Species", "Genus"))
+  }
+
+  # Add AllRegions column
+  merged_df <- merged_df %>%
+    rowwise() %>%
+    mutate(
+      AllRegions = if_else(
+        any(c_across(all_of(region_cols)) == "Yes", na.rm = TRUE),
+        "Yes",
+        "No"
+      )
+    ) %>%
+    ungroup()
+
+  # Summarise per Genus
+  genus_summary <- merged_df %>%
+    group_by(Genus) %>%
+    summarise(
+      TotalSpecies = n(),
+      YesCount = sum(AllRegions == "Yes"),
+      ProportionYes = YesCount / TotalSpecies,
+      .groups = "drop"
+    ) %>%
+    arrange(Genus)
+
+  genus_summary
+}
+
+genus_summary_12S <- calc_genus_coverage(merged_12S_coverage)
+genus_summary_16S <- calc_genus_coverage(merged_16S_coverage)
+
+```
+
+
+### Merge the 16S and 12S dataframes to compare
+
+```{r}
+# Rename columns to avoid problems when merging
+genus_summary_12S <- genus_summary_12S %>%
+  rename(
+    TotalSpecies_12S   = TotalSpecies,
+    YesCount_12S       = YesCount,
+    ProportionYes_12S  = ProportionYes
+  )
+
+genus_summary_16S <- genus_summary_16S %>%
+  rename(
+    TotalSpecies_16S   = TotalSpecies,
+    YesCount_16S       = YesCount,
+    ProportionYes_16S  = ProportionYes
+  )
+
+# Full join them by Genus so you get both sets of columns
+genus_summary_combined <- full_join(
+  genus_summary_12S,
+  genus_summary_16S,
+  by = "Genus"
+)
+
+# Reorder for readability
+genus_summary_combined <- genus_summary_combined %>%
+  select(
+    Genus,
+    TotalSpecies_12S, TotalSpecies_16S,
+    YesCount_12S, YesCount_16S, 
+    ProportionYes_12S, ProportionYes_16S
+  )
+
+genus_summary_combined
+
+# Check to see if the TotalSpecies value is consistent
+genus_summary_combined %>% filter(TotalSpecies_12S != TotalSpecies_16S)
+```
+
+### Consolidate duplicate columns
+
+```{r}
+# There's no mismatches so we can drop one of the columns and rename
+genus_summary_combined <- genus_summary_combined %>% select(-TotalSpecies_16S) %>% rename(TotalSpecies = TotalSpecies_12S)
+genus_summary_combined
+
+# See which species have the same vs. different data for 12S vs. 16S
+(diff_counts <- count(genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)))
+(same_counts <- count(genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)))
+genus_summary_combined %>% filter(YesCount_12S != YesCount_16S)
+genus_summary_combined %>% filter(YesCount_12S == YesCount_16S)
+```
+
+
+## Apply species DNA coverage value back to the original dataframe
+
+### Join to main dataframe
+
+```{r}
+# Create a new variable based on whether it's a 12 or 16 assay
+data <- data %>%
+  mutate(
+    Assay_Type = case_when(
+      Assay == "16SFish" ~ "16S",
+      Assay %in% c("MarVer1", "MiFishE2", "MiFishU", "MiFishUE", "MiFishUE2") ~ "12S",
+      TRUE ~ "Unknown"
+    )
+  )
+
+# Move the new variable to be with the other assay variables
+data <- data %>% relocate(Assay_Type, .after = 4)
+str(data)
+
+# Double check the numbers add up
+data %>% count(Assay_Type)
+data %>% count(Assay)
+
+# Update the dataframe with the genus DNA coverage based on whether a 12S or 16S match was used
+data <- data %>%
+  left_join(
+    genus_summary_combined,
+    by = c("genus" = "Genus")
+  ) %>%
+  mutate(
+    Pct_GenusDNA_inDB = case_when(
+      Assay_Type == "12S" ~ ProportionYes_12S,
+      Assay_Type == "16S" ~ ProportionYes_16S,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  relocate(Pct_GenusDNA_inDB, .after = 9)
+
+# Also take a max value across both
+data$Pct_GenusDNA_inDB_ANY <- pmax(data$ProportionYes_12S,data$ProportionYes_16S, na.rm=TRUE)
+str(data)
+```
+
+## ---FISH TREE OF LIFE---
+
+### Add species diversification rates to dataframe
+
+```{r}
+# Import tiprates.csv
+tiprates <- read_csv("../Data/tiprates.csv")
+
+# Join dr into main data by species
+data <- data %>% left_join(tiprates %>% select(species, dr), by = "species")
+
+# Rescale dr (diversification rate) to range 0–1
+data$dr_scaled <- scales::rescale(data$dr, to = c(0, 1))
+
+# Rescale log(dr) (diversification rate) to range 0–1
+data$dr_logscaled <- scales::rescale(log(data$dr), to = c(0.0, 1))
+
+# Histogram of values to understand their spread
+hist(data$dr)
+hist(data$dr_scaled)
+hist(data$dr_logscaled)
+```
+
+# CALCULATE SIMPLIFIED ACCURACY SCORE
+
+```{r}
+### ---Join GBIF species observation counts to main data
+# Validate multiple columns have identical data (only needed if GBIF_Taxonomy has been corrupted by multiple writes and column duplication)
+# sum(GBIF_Taxonomy$gbif_count_AOI.obs == GBIF_Taxonomy$gbif_count_AOI.tax) == nrow(GBIF_Taxonomy)
+# Deal with potential issues with variable names
+# Drop any columns that have been duplicated due to running the Rmd multiple times
+data <- data %>% select(-contains("obis_hits_AU"), -contains("gbif_count_AOI"))
+
+
+gbif_candidates <- c("gbif_count_AOI", "gbif_count_AOI.tax")
+gbif_chosen <- intersect(gbif_candidates, names(GBIF_Taxonomy))[1]
+if (is.na(gbif_chosen)) stop("Neither gbif_count_AOI nor gbif_count_AOI.tax exists.")
+
+data <- data %>%
+  left_join(
+    GBIF_Taxonomy %>%
+      select(taxonKey, gbif_count_AOI = all_of(gbif_chosen)),
+    by = "taxonKey"
+  )
+
+### ---Join OBIS species observation counts to main data
+# Import truth table
+obis_truth <- read_csv("../Data/species_in_LCA_truth_table.csv")
+
+# Join based on species name
+data <- data %>%
+  left_join(
+    obis_truth %>% select(candidate, obis_hits_AU),
+    by = c("species" = "candidate")
+  )
+
+# Sum total number of observations
+data$total_obs = data$gbif_count_AOI + data$obis_hits_AU
+data$total_obs_logscaled <- scales::rescale(log(data$total_obs), to = c(0, 1))
+data$total_obs_logscaled[data$total_obs_logscaled == -Inf] <- 0
+data$obs_score <- data$total_obs_logscaled * 0.025
+
+# Sum number of geographic evidence (ranges from 0 to 3 if GBIF, OBIS and AquaMaps all have data)
+# Note this is loose at the moment and based on any observation within 100km, could tighten if we want more precision
+data$count_geo_evidence <- rowSums(cbind(data$nearest_obs_100km, data$obis_within_100km, !is.na(data$am_prob)), na.rm = TRUE)
+
+# Max probability from the 3 different observation scores
+# <20k=1, <50k=0.99, <100k=0.90
+nz <- function(x) ifelse(is.na(x), FALSE, x)
+
+nearest_GBIF <- pmax(
+  ifelse(nz(data$nearest_obs_20km), 1.00, 0),
+  ifelse(nz(data$nearest_obs_50km), 0.99, 0),
+  ifelse(nz(data$nearest_obs_100km), 0.90, 0)
+)
+
+nearest_OBIS <- pmax(
+  ifelse(nz(data$obis_within_20km), 1.00, 0),
+  ifelse(nz(data$obis_within_50km), 0.99, 0),
+  ifelse(nz(data$obis_within_100km), 0.90, 0)
+)
+
+am_score <- ifelse(is.na(data$am_prob), 0, data$am_prob)
+
+data$geo_evidence_score <- pmax(nearest_GBIF, nearest_OBIS, am_score)
+
+# Calculate a DNA score which combines % of the genus with DNA in databases + with the diversification rate
+data$dr_logscaled[data$dr_logscaled == -Inf] <- 0
+data$DNA_score <- data$Pct_GenusDNA_inDB_ANY - (data$dr_logscaled * 0.025)
+
+# If any -Inf values slipped through, set to 0
+data <- data %>% mutate(across(c(DNA_score, obs_score), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+
+# Clean DNA_score (force numeric, replace NA and non-numeric with 0)
+data <- data %>%
+  mutate(DNA_score = suppressWarnings(as.numeric(DNA_score)),
+         DNA_score = replace_na(DNA_score, 0))
+
+# Blunt score = geo_evidence_score + dna_score + bonus points based whether it's a rare/common species
+data$blunt_score = data$geo_evidence_score * data$DNA_score + data$obs_score
+hist(data$blunt_score)
+
+```
+
+
+# EXPORT ENRICHED DATAFILE
+
+```{r}
+# DATAFRAME CLEANUP READY FOR EXPORT
+
+# Sort variables into groups
+sample_cols <-  c("ASV","sample","Assay", "Assay_Type", "count", "Assay_Length")
+species_cols <- c("class", "order", "family", "genus", "species", "taxonKey", "matchType")
+BLAST_cols <-   c("X.ID", "ASV_sequence")
+geoloc_cols <-  c("decimalLongitude", "decimalLatitude", "am_prob", "nearest_obs_m", "nearest_obs_20km", "nearest_obs_50km", "nearest_obs_100km", "nearest_obis_m",                              "obis_within_20km", "obis_within_50km", "obis_within_100km", "count_geo_evidence")
+dna_cols <-     c("TotalSpecies", "Pct_GenusDNA_inDB", "Pct_GenusDNA_inDB_ANY", "YesCount_12S", "YesCount_16S", "ProportionYes_12S", "ProportionYes_16S", "dr", "dr_scaled", "dr_logscaled")
+obs_cols <-     c("gbif_count_AOI", "obis_hits_AU", "total_obs", "total_obs_scaled", "total_obs_logscaled")
+score_cols <-   c("geo_evidence_score", "DNA_score", "obs_score", "blunt_score")
+
+data_final <- data %>% select(
+  any_of(sample_cols),
+  any_of(species_cols),
+  any_of(BLAST_cols),
+  any_of(geoloc_cols),
+  any_of(dna_cols),
+  any_of(obs_cols),
+  any_of(score_cols)
+)
+
+# RENAME: old -> new, then apply
+rename_map <- c(
+  "obis_hits_AU" = "OBIS_count",
+  "nearest_obs_m" = "nearest_GBIF_m",
+  "nearest_obs_20km"   = "GBIF_within_20km",
+  "nearest_obs_50km"   = "GBIF_within_50km",
+  "nearest_obs_100km"   = "GBIF_within_100km"
+)
+
+data_final <- data %>%
+  rename(!!!setNames(names(rename_map), rename_map)[names(rename_map) %in% names(.)])
+
+head(data)
+write_csv(data_final, "../Data/data_enriched.csv")
+```
+
