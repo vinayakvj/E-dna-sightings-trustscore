@@ -14,10 +14,31 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 library(tidyverse)
 library(ggplot2)
-data2 <- read_csv("../Data/data_enriched.csv")
+library(grid)
+library(patchwork)
+library(VennDiagram)
 
-# If any -inf values have slipped through change them to 0
-data2 <- data2 %>% mutate(across(c("DNA_score","obs_score"), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+data2 <- read_csv("../Data/data_enriched.csv")
+bayes <- read.csv("../Data/ALL_ROWS_BAYESIAN_DATA.csv")
+
+# If any -Inf values slipped through, set to 0
+data2 <- data2 %>%
+  mutate(across(c(DNA_score, obs_score), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+
+bayes <- bayes %>%
+  mutate(across(c(DNA_score, obs_score), ~ ifelse(is.infinite(.x) & .x < 0, 0, .x)))
+
+# Clean blunt_score (force numeric, replace NA and non-numeric with 0)
+bayes <- bayes %>%
+  mutate(blunt_score = suppressWarnings(as.numeric(blunt_score)),
+         blunt_score = replace_na(blunt_score, 0))
+
+data2 <- data2 %>%
+  mutate(blunt_score = suppressWarnings(as.numeric(blunt_score)),
+         blunt_score = replace_na(blunt_score, 0))
+
+
+str(bayes)
 ```
 
 
@@ -29,6 +50,7 @@ I was hoping in the second plot that there would be a stronger relationship betw
 
 ```{r cars}
 hist(data2$blunt_score, breaks=20)
+hist(bayes$Combined.Probability, breaks=20)
 plot(data2$X.ID,data2$blunt_score)
 ```
 
@@ -92,4 +114,171 @@ barplot(counts, main = "Use of data sources for validation sample location", yla
 
 ```
 
+## Comparison of Blunct Score Calculation and Bayesian Posterior Mean
+
+```{r}
+# Choose a common binwidth so the two histograms are comparable
+bin_w <- 0.02  # adjust to taste
+
+pBlunt <- ggplot(bayes, aes(x = blunt_score)) +
+  geom_histogram(binwidth = bin_w, linewidth = 0.2) +
+  labs(title = "Blunt score", x = "blunt_score", y = "Count") +
+  theme_minimal(base_size = 12)
+
+pBayes <- ggplot(bayes, aes(x = Combined.Probability)) +
+  geom_histogram(binwidth = bin_w, linewidth = 0.2) +
+  labs(title = "Posterior mean", x = "Combined.Probability", y = "Count") +
+  theme_minimal(base_size = 12)
+
+pBlunt + pBayes
+
+
+```
+
+The Bayesian approach always calculates a mean, whereas we have many missing values for the Blunt approach (approx 17%)
+
+```{r}
+avail <- tibble(total = nrow(bayes), blunt_p0 = sum(bayes$blunt_score==0), bayes_p0 = sum(bayes$Combined.Probability==0))
+avail
+
+# Compare histograms with 0 values removed
+
+# Make a paired subset (fair comparison)
+paired <- bayes %>% select(blunt_score, Combined.Probability) %>% filter(blunt_score>0, Combined.Probability>0)
+
+# Extract summary stats
+paired_summary <- paired %>%
+  summarise(
+    blunt_mean = mean(blunt_score),
+    blunt_median = median(blunt_score),
+    bayes_mean = mean(Combined.Probability),
+    bayes_median = median(Combined.Probability),
+    corr = cor(blunt_score, Combined.Probability)
+  )
+
+paired_summary
+
+# Side-by-side histograms (paired subset only)
+bin_w <- 0.02  # tweak if needed
+
+p_blunt <- ggplot(paired, aes(x = blunt_score)) +
+  geom_histogram(binwidth = bin_w, linewidth = 0.2) +
+  labs(title = "Blunt score (paired)", x = "blunt_score", y = "Count") +
+  theme_minimal(base_size = 12)
+
+p_bayes <- ggplot(paired, aes(x = Combined.Probability)) +
+  geom_histogram(binwidth = bin_w, linewidth = 0.2) +
+  labs(title = "Posterior mean (paired)", x = "Combined.Probability", y = "Count") +
+  theme_minimal(base_size = 12)
+
+p_blunt + p_bayes
+
+```
+## Proportin of scores with > 0.9 probability
+
+```{r}
+venn_cutoff = 0.8
+
+bayes %>%
+  summarise(
+    blunt_count = sum(blunt_score > venn_cutoff, na.rm = TRUE),
+    blunt_pct = mean(blunt_score > venn_cutoff, na.rm = TRUE),
+    bayes_count = sum(Combined.Probability > venn_cutoff, na.rm = TRUE),
+        bayes_pct = mean(Combined.Probability > venn_cutoff, na.rm = TRUE)
+  )
+
+cmp <- bayes %>% mutate(blunt90 = blunt_score > venn_cutoff, bayes90 = Combined.Probability > venn_cutoff)
+
+# 2×2 contingency table of selections
+overlap_tbl <- cmp %>% count(blunt90, bayes90)
+overlap_tbl
+
+both        <- sum(cmp$blunt90 & cmp$bayes90, na.rm = TRUE)
+blunt_only  <- sum(cmp$blunt90 & !cmp$bayes90, na.rm = TRUE)
+bayes_only  <- sum(!cmp$blunt90 & cmp$bayes90, na.rm = TRUE)
+neither     <- sum(!cmp$blunt90 & !cmp$bayes90, na.rm = TRUE)
+
+# If you want simple overlap scores (treat Bayes as "reference"):
+precision <- ifelse((both + blunt_only) > 0,  both / (both + blunt_only), NA_real_)
+recall    <- ifelse((both + bayes_only) > 0, both / (both + bayes_only), NA_real_)
+f1        <- ifelse(is.finite(precision + recall) & (precision + recall) > 0,
+                    2 * precision * recall / (precision + recall), NA_real_)
+jaccard   <- ifelse((both + blunt_only + bayes_only) > 0,
+                    both / (both + blunt_only + bayes_only), NA_real_)
+
+tibble(both, blunt_only, bayes_only, neither, precision, recall, f1, jaccard)
+
+
+
+# Venn diagram of >0.9 overlap
+blunt_only <- overlap_tbl %>% filter(blunt90, !bayes90) %>% pull(n)
+bayes_only <- overlap_tbl %>% filter(!blunt90, bayes90) %>% pull(n)
+both       <- overlap_tbl %>% filter(blunt90,  bayes90) %>% pull(n)
+
+grid.newpage()
+draw.pairwise.venn(
+  area1 = blunt_only + both,
+  area2 = bayes_only + both,
+  cross.area = both,
+  category = c("Blunt > 0.5", "Bayes > 0.5")
+)
+
+```
+## Comparing extreme differences in the predictions
+
+
+```{r}
+# Thresholds for comparison
+thr_low  <- 0.1
+thr_high <- 0.9
+
+# keep only rows where both values are present
+bx <- bayes %>%
+  filter(!is.na(blunt_score), !is.na(Combined.Probability)) %>%
+  mutate(diff = Combined.Probability - blunt_score)
+
+# Case A: blunt very low, Bayes very high
+low_blunt_high_bayes <- bx %>%
+  filter(blunt_score <= thr_low, Combined.Probability >= thr_high) %>%
+  arrange(desc(diff))
+
+# Case B: blunt very high, Bayes very low
+high_blunt_low_bayes <- bx %>%
+  filter(blunt_score >= thr_high, Combined.Probability <= thr_low) %>%
+  arrange(diff)
+
+# Quick counts so you know what you have
+tibble(
+  low_blunt_high_bayes = nrow(low_blunt_high_bayes),
+  high_blunt_low_bayes = nrow(high_blunt_low_bayes)
+)
+
+# Peek a few rows (put key columns first, then everything else)
+low_blunt_high_bayes %>%
+  relocate(blunt_score, Combined.Probability, diff) %>%
+  slice_head(n = 50)
+
+high_blunt_low_bayes %>%
+  relocate(blunt_score, Combined.Probability, diff) %>%
+  slice_head(n = 50)
+
+```
+
+```{r}
+original <- read_csv("../Data/all_voyages.csv")
+data <- read_csv("../Data/data_enriched.csv")
+
+nrow(original)
+nrow(data)
+```
+
+```{r}
+sum(data$matchType=="EXACT", na.rm = TRUE)
+sum(data$has_species==TRUE, na.rm = TRUE)
+sum(is.na(data$nearest_obis_m))
+sum(is.na(data$dr))
+sum(is.na(data$TotalSpecies))
+sum(is.na(data$Pct_GenusDNA_inDB_ANY))
+
+```
 
