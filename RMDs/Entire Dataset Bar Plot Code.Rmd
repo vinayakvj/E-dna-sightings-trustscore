@@ -1,0 +1,65 @@
+---
+title: "Analysis of Final Data"
+author: "Ray Stokes"
+date: "2025-10-14"
+output: html_document
+---
+
+
+
+```{r}
+entire_dataset <- read.csv("ALL_ROWS_BAYESIAN_DATA.csv")
+```
+
+
+```{r}
+
+#################### Can set thresholds that make the most sense ######################
+
+# High high does the lower confidence interval have to be to make a result highly likely?
+posterior_confidence_threshold = 0.5 
+
+# If doesn't meet the above criteria, how high should the expected probability be?
+probability_threshold = 0.75
+
+#######################################################################################
+
+
+condition1 = entire_dataset$Lower.Confidence.Interval > posterior_confidence_threshold
+condition2 = entire_dataset$Combined.Probability > probability_threshold
+
+condition3 = entire_dataset$DNA.Match.Lower.Confidence.Interval > posterior_confidence_threshold
+condition4 = entire_dataset$DNA.Match.Probability > probability_threshold
+
+
+# Can relabel as you see fit, they are in decreasing order of certainty
+label = ifelse(condition1, "Highly likely", ifelse(condition2, "Likely", ifelse(condition3, "Likely moved", ifelse(condition4,"Maybe moved","Unlikely"))))
+
+
+library(ggplot2)
+
+entire_dataset$Verdict = label
+ggplot(data=entire_dataset) + geom_bar(aes(x=Verdict),fill='darkorange1') + labs(title="Summary Plot for eDNA Bayesian Results")
+
+```
+
+```{r}
+# Proportions plot
+t = data.frame(table(entire_dataset$Verdict))
+names(t) = c("Verdict","Count")
+t$Verdict = as.character(t$Verdict)
+t$proportion = paste(round(t$Count / nrow(entire_dataset)*100,2), "%")
+
+ggplot(t, aes(x=Verdict, y=Count)) +
+  geom_bar(stat = "identity",fill='darkorange1') +
+  labs(title="Summary Plot for eDNA Bayesian Results") + 
+  geom_text(aes(label = proportion), vjust = 1.5, color = "white", size = 5)
+
+```
+
+
+
+
+
+
+
